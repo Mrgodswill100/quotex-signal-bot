@@ -1,14 +1,20 @@
-import threading
 import os
-from server import app
+import threading
+from flask import Flask
 from bot import main as run_bot
 
-def run_server():
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def index():
+    return "Quotex signal bot is running."
+
+def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_server, daemon=True)
+    t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     run_bot()
-  
+    
