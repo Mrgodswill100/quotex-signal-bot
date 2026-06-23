@@ -3,7 +3,19 @@ import asyncio
 import json
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
+
+DURATION_MINUTES = {
+    "1 min": 1, "5 min": 5, "15 min": 15, "30 min": 30, "1 hour": 60
+}
+
+def get_expiry_time(duration: str) -> str:
+    mins = DURATION_MINUTES.get(duration, 5)
+    now = datetime.utcnow()
+    # Round up to next candle open
+    rounded = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    expiry  = rounded + timedelta(minutes=mins)
+    return expiry.strftime("%H:%M UTC")
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -35,9 +47,9 @@ TIMEFRAMES = {
 }
 
 # Lowered for more signals (was 9)
-MIN_CONFLUENCE = 6
+MIN_CONFLUENCE = 4
 # Allow 2 out of 3 TFs to agree (was all 3)
-MIN_TF_AGREE_RATIO = 0.67
+MIN_TF_AGREE_RATIO = 0.34  # at least 1 TF
 
 SELECT_PAIR, SELECT_DURATION = range(2)
 
@@ -341,8 +353,8 @@ def score_timeframe(candles):
     atr_res = calc_atr(candles)
     if atr_res:
         ap = atr_res["atr_pct"]
-        if ap < 0.02:    score -= 1; lbl = f"Very low volatility ({ap}%) ⚠️"
-        elif ap > 0.3:   score -= 1; lbl = f"Very high volatility ({ap}%) ⚠️"
+        if ap < 0.005:   score -= 1; lbl = f"Extremely low volatility ({ap}%) ⚠️"
+        elif ap > 0.5:   score -= 1; lbl = f"Very high volatility ({ap}%) ⚠️"
         else:            score += 1; lbl = f"Good volatility ({ap}%) ✅"
         details["atr"] = {"label": lbl}
 
@@ -356,7 +368,7 @@ def score_timeframe(candles):
         elif adx >= 25 and dip > dim: score += 1; lbl = f"Uptrend ADX={adx}"
         elif adx >= 30 and dim > dip: score -= 2; lbl = f"Strong downtrend ADX={adx} 💪"
         elif adx >= 25 and dim > dip: score -= 1; lbl = f"Downtrend ADX={adx}"
-        elif adx < 20:                            lbl = f"Weak trend ADX={adx} — ranging ⚠️"
+        elif adx < 20:                            score += 0; lbl = f"Ranging ADX={adx} (neutral)"
         else:                                     lbl = f"Moderate trend ADX={adx}"
         details["adx"] = {"label": lbl}
 
@@ -409,21 +421,32 @@ async def analyse_pair(pair, duration):
 
     scored = [r for r in tf_results.values() if not r.get("error")]
     n = len(scored)
+
+    # Count bullish and bearish INDICATORS across all TFs (not just TF scores)
+    bull_inds = 0
+    bear_inds = 0
+    total_inds = 0
+    for r in scored:
+        for k, v in r["details"].items():
+            lbl = v["label"].lower()
+            total_inds += 1
+            if any(x in lbl for x in ["oversold","bull","below vwap","support","buy zone","uptrend","bullish cross","fresh bull","strong up"]):
+                bull_inds += 1
+            elif any(x in lbl for x in ["overbought","bear","above vwap","resistance","sell zone","downtrend","bearish cross","fresh bear","strong down"]):
+                bear_inds += 1
+
     bulls = sum(1 for r in scored if r["score"] > 0)
     bears = sum(1 for r in scored if r["score"] < 0)
-
-    # Looser: 2 out of 3 TFs agreeing is enough
     bull_ratio = bulls / n if n else 0
     bear_ratio = bears / n if n else 0
-    bull_agree = bull_ratio >= MIN_TF_AGREE_RATIO
-    bear_agree = bear_ratio >= MIN_TF_AGREE_RATIO
     all_agree  = bulls == n or bears == n
 
-    strength = min(round(abs(total_score) / (n * 21) * 100), 95)
+    strength = min(round(abs(total_score) / max(n * 21, 1) * 100), 95)
 
-    if total_score >= MIN_CONFLUENCE and bull_agree:
+    # Fire signal if 4+ indicators agree in same direction
+    if bull_inds >= 4 and bull_inds > bear_inds:
         direction, emoji, sig = "BUY",  "🟢", "📈"
-    elif total_score <= -MIN_CONFLUENCE and bear_agree:
+    elif bear_inds >= 4 and bear_inds > bull_inds:
         direction, emoji, sig = "SELL", "🔴", "📉"
     else:
         direction, emoji, sig = "WAIT", "🟡", "⏳"
@@ -433,6 +456,7 @@ async def analyse_pair(pair, duration):
         "error": False, "direction": direction, "emoji": emoji, "signal_emoji": sig,
         "strength": strength, "total_score": total_score,
         "all_agree": all_agree, "bull_ratio": bull_ratio, "bear_ratio": bear_ratio,
+        "bull_inds": bull_inds, "bear_inds": bear_inds, "total_inds": total_inds,
         "tf_results": tf_results, "tfs": [lbl for _, lbl in tf_list],
     }
 
@@ -445,169 +469,50 @@ INDICATOR_LABELS = {
     "adx": "ADX  ", "vwap": "VWAP ", "sr": "S/R  ",
 }
 
+def _ind_icon(key, label):
+    """Convert indicator label to a short emoji status."""
+    l = label.lower()
+    if any(x in l for x in ["oversold","bull","below vwap","support","buy zone","uptrend","bullish cross","fresh bull"]):
+        return "🟢"
+    if any(x in l for x in ["overbought","bear","above vwap","resistance","sell zone","downtrend","bearish cross","fresh bear"]):
+        return "🔴"
+    if any(x in l for x in ["squeeze","avoid","extreme","ranging"]):
+        return "⚠️"
+    return "🟡"
+
 def format_signal(pair, duration, analysis):
-    now = datetime.utcnow().strftime("%H:%M UTC  %d %b %Y")
+    now = datetime.utcnow().strftime("%H:%M  %d %b %Y")
     lines = [
-        "╔══════════════════════════════╗",
-        "║   📊  QUOTEX SIGNAL BOT      ║",
-        "╚══════════════════════════════╝", "",
-        f"💱  Pair:       *{pair}*",
-        f"⏱   Duration:  *{duration}*",
-        f"🕐  Time:       {now}", "",
-        "━━━━  MULTI-TIMEFRAME ANALYSIS  ━━━━",
+        "╔══════════════════════╗",
+        "║  📊 QUOTEX SIGNALS   ║",
+        "╚══════════════════════╝",
+        f"💱 *{pair}*  ⏱ *{duration}*",
+        f"🕐 {now}", "",
+        "─── TIMEFRAME BREAKDOWN ───",
     ]
 
     for tf in analysis["tfs"]:
         r = analysis["tf_results"].get(tf, {})
         if r.get("error"):
-            lines += ["", f"📌 *{tf}* — ⚠️ No data"]; continue
+            lines += [f"*{tf}* ⚠️ No data"]; continue
         sc = r["score"]; d = r["details"]
-        bias = "🟢 Bullish" if sc > 0 else ("🔴 Bearish" if sc < 0 else "🟡 Neutral")
-        lines += ["", f"📌 *{tf}* — {bias}  (score {sc:+d})"]
-        for k, lbl in INDICATOR_LABELS.items():
+        bias = "🟢" if sc > 0 else ("🔴" if sc < 0 else "🟡")
+
+        # One line per indicator: ICON  NAME
+        ind_line = ""
+        for k in ["rsi","macd","ema","bb","stoch","atr","adx","vwap","sr"]:
             if k in d:
-                lines.append(f"  • {lbl} → {d[k]['label']}")
+                icon = _ind_icon(k, d[k]["label"])
+                ind_line += f"{icon}{k.upper()} "
+
+        lines += [f"*{tf}* {bias} `{sc:+d}`  {ind_line.strip()}"]
 
     pct  = analysis["strength"]
     fill = min(int(pct/10), 10)
-    bar  = "█" * fill + "░" * (10-fill)
+    bar  = "█"*fill + "░"*(10-fill)
 
-    # TF agreement display
-    br = round(analysis.get("bull_ratio", 0)*100)
-    er = round(analysis.get("bear_ratio", 0)*100)
-    agree_str = f"{br}% bull" if analysis["direction"] == "BUY" else (
-                f"{er}% bear" if analysis["direction"] == "SELL" else "Mixed")
+    lines += ["", "──────────────────────────", ""]
 
-    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-
-    if analysis["direction"] == "WAIT":
-        lines += [
-            "🟡  *SIGNAL:  WAIT ⏳*", "",
-            "_Confluence not strong enough._",
-            "_Wait for a cleaner setup._",
-        ]
-    else:
-        lines += [
-            f"{analysis['emoji']}  *SIGNAL:  {analysis['direction']} {analysis['signal_emoji']}*",
-            f"📶  Confidence:    *{pct}%*",
-            f"📊  Confluence:    `[{bar}]`",
-            f"🎯  TF Agreement:  {agree_str}",
-            f"{'✅  All TFs aligned!' if analysis['all_agree'] else '⚡  Majority aligned'}",
-            "", f"_Enter at open of next {duration} candle._",
-        ]
-
-    lines += ["", "⚠️ _For educational purposes only. Trade responsibly._"]
-    return "\n".join(lines)
-
-
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("📊 Generate Signal", callback_data="new_signal")]]
-    await update.message.reply_text(
-        "👋 Welcome to *Quotex Signal Bot*!\n\n"
-        "🧠 *9 indicators across 3 timeframes:*\n"
-        "• RSI  • MACD  • EMA 9/21/50\n"
-        "• Bollinger Bands  • Stochastic\n"
-        "• ATR  • ADX  • VWAP  • Support/Resistance\n\n"
-        "📡 Live data — real market prices\n"
-        "⚡ Signals fire when majority of TFs agree\n\n"
-        "Tap below to get started 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown",
-    )
-
-
-async def new_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    kb = [[InlineKeyboardButton(p, callback_data=f"pair_{p}") for p in row]
-          for row in FOREX_PAIRS]
-    await q.edit_message_text(
-        "💱 *Select a Forex pair:*",
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    return SELECT_PAIR
-
-
-async def pair_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    pair = q.data.replace("pair_", "")
-    ctx.user_data["pair"] = pair
-    kb = [[InlineKeyboardButton(d, callback_data=f"dur_{d}")] for d in DURATIONS]
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="new_signal")])
-    await q.edit_message_text(
-        f"✅ Pair: *{pair}*\n\n⏱ *Select trade duration:*",
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    return SELECT_DURATION
-
-
-async def duration_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    duration = q.data.replace("dur_", "")
-    pair = ctx.user_data.get("pair", "EUR/USD")
-    await q.edit_message_text(
-        f"📡 Fetching live data for *{pair}*...\n"
-        f"🧠 Running 9 indicators × 3 timeframes ⏳",
-        parse_mode="Markdown")
-    analysis = await analyse_pair(pair, duration)
-    if analysis.get("error"):
-        await q.edit_message_text(
-            f"⚠️ *Error:* {analysis['message']}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Retry", callback_data=f"dur_{duration}"),
-                InlineKeyboardButton("🔙 Back",  callback_data="new_signal"),
-            ]]))
-        return SELECT_DURATION
-    await q.edit_message_text(
-        format_signal(pair, duration, analysis),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Refresh",  callback_data=f"dur_{duration}"),
-            InlineKeyboardButton("💱 New Pair", callback_data="new_signal"),
-        ]]))
-    return SELECT_DURATION
-
-
-async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Quotex Signal Bot — 9 Indicator Engine*\n\n"
-        "• RSI (14) — overbought/oversold\n"
-        "• MACD (12,26,9) — momentum & crossovers\n"
-        "• EMA 9/21/50 — triple stack trend\n"
-        "• Bollinger Bands — volatility & squeeze\n"
-        "• Stochastic (14,3) — entry timing\n"
-        "• ATR — volatility filter\n"
-        "• ADX — trend strength\n"
-        "• VWAP — fair value level\n"
-        "• Support & Resistance — key levels\n\n"
-        "Signal fires when *majority of TFs agree*.\n\n"
-        "⚠️ _For educational purposes only._",
-        parse_mode="Markdown",
-    )
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    if not TOKEN: raise ValueError("TELEGRAM_BOT_TOKEN not set")
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(new_signal, pattern="^new_signal$")],
-        states={
-            SELECT_PAIR: [CallbackQueryHandler(pair_selected, pattern="^pair_")],
-            SELECT_DURATION: [
-                CallbackQueryHandler(duration_selected, pattern="^dur_"),
-                CallbackQueryHandler(new_signal, pattern="^new_signal$"),
-            ],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        per_message=False,
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv)
-    print("🤖 Quotex Signal Bot (9 indicators) running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+    bull_inds = analysis.get("bull_inds", 0)
+    bear_inds = analysis.get("bear_inds", 0)
+    total_i
