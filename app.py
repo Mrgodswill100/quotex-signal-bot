@@ -1,518 +1,398 @@
-import os
-import asyncio
-import json
-import urllib.request
-import urllib.parse
+import os, sys, asyncio, json, threading, urllib.request, urllib.parse
 from datetime import datetime, timedelta
-
-DURATION_MINUTES = {
-    "1 min": 1, "5 min": 5, "15 min": 15, "30 min": 30, "1 hour": 60
-}
-
-def get_expiry_time(duration: str) -> str:
-    mins = DURATION_MINUTES.get(duration, 5)
-    now = datetime.utcnow()
-    # Round up to next candle open
-    rounded = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    expiry  = rounded + timedelta(minutes=mins)
-    return expiry.strftime("%H:%M UTC")
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, ConversationHandler
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler
 
 TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TD_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 TD_BASE    = "https://api.twelvedata.com"
 
 FOREX_PAIRS = [
-    ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF"],
-    ["AUD/USD", "USD/CAD", "NZD/USD", "EUR/GBP"],
-    ["EUR/JPY", "GBP/JPY", "EUR/AUD", "GBP/AUD"],
-    ["AUD/JPY", "CAD/JPY", "CHF/JPY", "NZD/JPY"],
-    ["EUR/CAD", "EUR/CHF", "GBP/CAD", "GBP/CHF"],
-    ["AUD/CAD", "AUD/CHF", "AUD/NZD", "NZD/CAD"],
-    ["USD/SGD", "USD/MXN", "USD/ZAR", "USD/NOK"],
+    ["EUR/USD","GBP/USD","USD/JPY","USD/CHF"],
+    ["AUD/USD","USD/CAD","NZD/USD","EUR/GBP"],
+    ["EUR/JPY","GBP/JPY","EUR/AUD","GBP/AUD"],
+    ["AUD/JPY","CAD/JPY","CHF/JPY","NZD/JPY"],
+    ["EUR/CAD","EUR/CHF","GBP/CAD","GBP/CHF"],
+    ["AUD/CAD","AUD/CHF","AUD/NZD","NZD/CAD"],
+    ["USD/SGD","USD/MXN","USD/ZAR","USD/NOK"],
 ]
-
-DURATIONS = ["1 min", "5 min", "15 min", "30 min", "1 hour"]
-
+DURATIONS = ["1 min","5 min","15 min","30 min","1 hour"]
 TIMEFRAMES = {
-    "1 min":  [("1min","M1"),  ("5min","M5"),  ("15min","M15")],
-    "5 min":  [("5min","M5"),  ("15min","M15"),("1h","H1")],
-    "15 min": [("15min","M15"),("1h","H1"),    ("4h","H4")],
-    "30 min": [("30min","M30"),("1h","H1"),    ("4h","H4")],
-    "1 hour": [("1h","H1"),    ("4h","H4"),    ("1day","D1")],
+    "1 min":  [("1min","M1"),("5min","M5"),("15min","M15")],
+    "5 min":  [("5min","M5"),("15min","M15"),("1h","H1")],
+    "15 min": [("15min","M15"),("1h","H1"),("4h","H4")],
+    "30 min": [("30min","M30"),("1h","H1"),("4h","H4")],
+    "1 hour": [("1h","H1"),("4h","H4"),("1day","D1")],
 }
-
-# Lowered for more signals (was 9)
-MIN_CONFLUENCE = 4
-# Allow 2 out of 3 TFs to agree (was all 3)
-MIN_TF_AGREE_RATIO = 0.34  # at least 1 TF
-
+DURATION_MINUTES = {"1 min":1,"5 min":5,"15 min":15,"30 min":30,"1 hour":60}
 SELECT_PAIR, SELECT_DURATION = range(2)
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# ── Data fetching ─────────────────────────────────────────────────────────────
+def get_expiry_time(duration):
+    mins = DURATION_MINUTES.get(duration, 5)
+    expiry = datetime.utcnow().replace(second=0, microsecond=0) + timedelta(minutes=mins+1)
+    return expiry.strftime("%H:%M UTC")
 
-def fetch_candles_sync(pair, interval, outputsize=100):
-    params = urllib.parse.urlencode({
-        "symbol": pair, "interval": interval,
-        "outputsize": outputsize, "apikey": TD_API_KEY, "format": "JSON",
-    })
+def fetch_sync(pair, interval, size=100):
+    p = urllib.parse.urlencode({"symbol":pair,"interval":interval,"outputsize":size,"apikey":TD_API_KEY,"format":"JSON"})
     try:
-        with urllib.request.urlopen(f"{TD_BASE}/time_series?{params}", timeout=20) as r:
-            data = json.loads(r.read().decode())
-        if data.get("status") == "error" or "values" not in data:
-            return None
-        return data["values"]
-    except Exception:
+        with urllib.request.urlopen(f"{TD_BASE}/time_series?{p}", timeout=20) as r:
+            d = json.loads(r.read().decode())
+        return d.get("values") if "values" in d else None
+    except:
         return None
 
+async def fetch(pair, interval, size=100):
+    return await asyncio.get_event_loop().run_in_executor(None, fetch_sync, pair, interval, size)
 
-async def fetch_candles(pair, interval, outputsize=100):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fetch_candles_sync, pair, interval, outputsize)
+def closes(c): return [float(x["close"]) for x in c]
+def highs(c):  return [float(x["high"])  for x in c]
+def lows(c):   return [float(x["low"])   for x in c]
+def vols(c):
+    try: return [float(x.get("volume",1)) for x in c]
+    except: return [1.0]*len(c)
 
+# ── Indicators ────────────────────────────────────────────────────────────────
 
-# ── Indicator calculations ────────────────────────────────────────────────────
+def rsi(prices, p=14):
+    if len(prices)<p+1: return None
+    pr=list(reversed(prices))
+    g=[max(pr[i]-pr[i-1],0) for i in range(1,p+1)]
+    l=[max(pr[i-1]-pr[i],0) for i in range(1,p+1)]
+    ag,al=sum(g)/p,sum(l)/p
+    for i in range(p+1,len(pr)):
+        d=pr[i]-pr[i-1]; ag=(ag*(p-1)+max(d,0))/p; al=(al*(p-1)+max(-d,0))/p
+    return round(100-(100/(1+ag/al)),2) if al else 100.0
 
-def get_closes(c): return [float(x["close"]) for x in c]
-def get_highs(c):  return [float(x["high"])  for x in c]
-def get_lows(c):   return [float(x["low"])   for x in c]
-def get_volumes(c):
-    try:    return [float(x.get("volume", 0)) for x in c]
-    except: return [0.0] * len(c)
+def ema(prices, p):
+    if len(prices)<p: return None
+    pr=list(reversed(prices)); k=2/(p+1); e=sum(pr[:p])/p
+    for x in pr[p:]: e=x*k+e*(1-k)
+    return round(e,6)
 
+def macd(prices):
+    if len(prices)<35: return None
+    pr=list(reversed(prices)); k12,k26,k9=2/13,2/27,2/10
+    e12=sum(pr[:12])/12; e26=sum(pr[:26])/26; ms=[]
+    for i in range(26,len(pr)):
+        e12=pr[i]*k12+e12*(1-k12); e26=pr[i]*k26+e26*(1-k26); ms.append(e12-e26)
+    if len(ms)<9: return None
+    sig=sum(ms[:9])/9
+    for v in ms[9:]: sig=v*k9+sig*(1-k9)
+    ml=ms[-1]; prev=ms[-2] if len(ms)>=2 else ml
+    return round(ml,6),round(sig,6),round(ml-sig,6),prev
 
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1: return None
-    p = list(reversed(prices))
-    gains = [max(p[i]-p[i-1], 0) for i in range(1, period+1)]
-    losses= [max(p[i-1]-p[i], 0) for i in range(1, period+1)]
-    ag, al = sum(gains)/period, sum(losses)/period
-    for i in range(period+1, len(p)):
-        d = p[i]-p[i-1]
-        ag = (ag*(period-1)+max(d,0))/period
-        al = (al*(period-1)+max(-d,0))/period
-    return round(100-(100/(1+ag/al)), 2) if al else 100.0
+def bollinger(prices, p=20):
+    if len(prices)<p: return None
+    w=[float(x) for x in prices[:p]]; mid=sum(w)/p
+    std=(sum((x-mid)**2 for x in w)/p)**0.5
+    up,lo=mid+2*std,mid-2*std; cur=prices[0]
+    pb=(cur-lo)/(up-lo) if up!=lo else 0.5
+    return {"pct_b":round(pb,4),"bw":round((up-lo)/mid if mid else 0,6)}
 
+def stochastic(c, kp=14, dp=3):
+    if len(c)<kp+dp: return None
+    cl,hi,lo=closes(c),highs(c),lows(c); kv=[]
+    for i in range(dp+1):
+        wh,wl=max(hi[i:i+kp]),min(lo[i:i+kp])
+        kv.append(100*(cl[i]-wl)/(wh-wl) if wh!=wl else 50.0)
+    return {"k":round(kv[0],2),"d":round(sum(kv[:dp])/dp,2),"pk":kv[1]}
 
-def calc_ema(prices, period):
-    if len(prices) < period: return None
-    p = list(reversed(prices))
-    k = 2/(period+1)
-    ema = sum(p[:period])/period
-    for x in p[period:]: ema = x*k + ema*(1-k)
-    return round(ema, 6)
+def atr(c, p=14):
+    if len(c)<p+1: return None
+    cl,hi,lo=closes(c),highs(c),lows(c)
+    trs=[max(hi[i]-lo[i],abs(hi[i]-cl[i+1]),abs(lo[i]-cl[i+1])) for i in range(p)]
+    a=sum(trs)/p
+    return round((a/cl[0])*100,4) if cl[0] else 0
 
+def adx(c, p=14):
+    if len(c)<p*2: return None
+    hi=list(reversed(highs(c))); lo=list(reversed(lows(c))); cl=list(reversed(closes(c)))
+    pdm,mdm,trl=[],[],[]
+    for i in range(1,len(hi)):
+        hd=hi[i]-hi[i-1]; ld=lo[i-1]-lo[i]
+        pdm.append(hd if hd>ld and hd>0 else 0)
+        mdm.append(ld if ld>hd and ld>0 else 0)
+        trl.append(max(hi[i]-lo[i],abs(hi[i]-cl[i-1]),abs(lo[i]-cl[i-1])))
+    def ws(d,p):
+        s=sum(d[:p]); r=[s]
+        for v in d[p:]: s=s-s/p+v; r.append(s)
+        return r
+    at=ws(trl,p); pd=ws(pdm,p); md=ws(mdm,p)
+    dip=[100*a/b if b else 0 for a,b in zip(pd,at)]
+    dim=[100*a/b if b else 0 for a,b in zip(md,at)]
+    dx=[100*abs(a-b)/(a+b) if (a+b) else 0 for a,b in zip(dip,dim)]
+    if len(dx)<p: return None
+    adxv=sum(dx[:p])/p
+    for v in dx[p:]: adxv=(adxv*(p-1)+v)/p
+    return {"adx":round(adxv,2),"dip":round(dip[-1],2),"dim":round(dim[-1],2)}
 
-def calc_macd(prices):
-    if len(prices) < 35: return None
-    p = list(reversed(prices))
-    k12, k26, k9 = 2/13, 2/27, 2/10
-    e12 = sum(p[:12])/12
-    e26 = sum(p[:26])/26
-    ms = []
-    for i in range(26, len(p)):
-        e12 = p[i]*k12+e12*(1-k12)
-        e26 = p[i]*k26+e26*(1-k26)
-        ms.append(e12-e26)
-    if len(ms) < 9: return None
-    sig = sum(ms[:9])/9
-    for v in ms[9:]: sig = v*k9+sig*(1-k9)
-    ml = ms[-1]
-    prev = ms[-2] if len(ms) >= 2 else ml
-    return round(ml,6), round(sig,6), round(ml-sig,6), prev
+def vwap(c):
+    cl,hi,lo,vs=closes(c),highs(c),lows(c),vols(c)
+    tpv=sum(((hi[i]+lo[i]+cl[i])/3)*(vs[i] if vs[i]>0 else 1) for i in range(len(c)))
+    tv=sum(vs[i] if vs[i]>0 else 1 for i in range(len(c)))
+    v=tpv/tv if tv else cl[0]
+    return round(((cl[0]-v)/v*100),4) if v else 0
 
+def snr(c, lb=50):
+    if len(c)<10: return None
+    hi=highs(c[:lb]); lo=lows(c[:lb]); cl=closes(c)
+    cur=cl[0]; sh,sl=[],[]
+    for i in range(2,min(len(hi),lb)-2):
+        if hi[i]>hi[i-1] and hi[i]>hi[i-2] and hi[i]>hi[i+1] and hi[i]>hi[i+2]: sh.append(hi[i])
+        if lo[i]<lo[i-1] and lo[i]<lo[i-2] and lo[i]<lo[i+1] and lo[i]<lo[i+2]: sl.append(lo[i])
+    res=min((h for h in sh if h>cur),default=max(hi))
+    sup=max((l for l in sl if l<cur),default=min(lo))
+    return {"sup":round(sup,6),"res":round(res,6),
+            "dtr":round((res-cur)/cur*100,4),"dts":round((cur-sup)/cur*100,4)}
 
-def calc_bollinger(prices, period=20):
-    if len(prices) < period: return None
-    w = [float(x) for x in prices[:period]]
-    mid = sum(w)/period
-    std = (sum((x-mid)**2 for x in w)/period)**0.5
-    upper, lower = mid+2*std, mid-2*std
-    cur = prices[0]
-    pct_b = (cur-lower)/(upper-lower) if upper != lower else 0.5
-    bw = (upper-lower)/mid if mid else 0
-    return {"pct_b": round(pct_b,4), "bw": round(bw,6), "upper": upper, "lower": lower, "mid": mid}
+# ── Score ─────────────────────────────────────────────────────────────────────
 
+def score_tf(c):
+    sc=0; det={}; cl=closes(c)
 
-def calc_stochastic(candles, k_period=14, d_period=3):
-    if len(candles) < k_period+d_period: return None
-    cl, hi, lo = get_closes(candles), get_highs(candles), get_lows(candles)
-    kv = []
-    for i in range(d_period+1):
-        wh, wl = max(hi[i:i+k_period]), min(lo[i:i+k_period])
-        kv.append(100*(cl[i]-wl)/(wh-wl) if wh != wl else 50.0)
-    return {"k": round(kv[0],2), "d": round(sum(kv[:d_period])/d_period,2), "prev_k": kv[1]}
+    v=rsi(cl)
+    if v is not None:
+        if v<=20:   sc+=3;lbl=f"Oversold({v})🔥"
+        elif v<=44: sc+=1;lbl=f"Mild bull({v})"
+        elif v>=80: sc-=3;lbl=f"Overbought({v})🔥"
+        elif v>=56: sc-=1;lbl=f"Mild bear({v})"
+        else:           lbl=f"Neutral({v})"
+        det["rsi"]=lbl
 
-
-def calc_atr(candles, period=14):
-    """Average True Range — measures volatility."""
-    if len(candles) < period+1: return None
-    cl, hi, lo = get_closes(candles), get_highs(candles), get_lows(candles)
-    trs = []
-    for i in range(period):
-        tr = max(hi[i]-lo[i], abs(hi[i]-cl[i+1]), abs(lo[i]-cl[i+1]))
-        trs.append(tr)
-    atr = sum(trs)/period
-    # Express as % of price for cross-pair comparison
-    atr_pct = (atr / cl[0]) * 100 if cl[0] else 0
-    return {"atr": round(atr, 6), "atr_pct": round(atr_pct, 4)}
-
-
-def calc_adx(candles, period=14):
-    """ADX — measures trend strength (not direction). >25 = strong trend."""
-    if len(candles) < period*2: return None
-    hi, lo, cl = get_highs(candles), get_lows(candles), get_closes(candles)
-    # Reverse to oldest-first
-    hi = list(reversed(hi)); lo = list(reversed(lo)); cl = list(reversed(cl))
-
-    plus_dm, minus_dm, tr_list = [], [], []
-    for i in range(1, len(hi)):
-        h_diff = hi[i] - hi[i-1]
-        l_diff = lo[i-1] - lo[i]
-        plus_dm.append(h_diff if h_diff > l_diff and h_diff > 0 else 0)
-        minus_dm.append(l_diff if l_diff > h_diff and l_diff > 0 else 0)
-        tr = max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
-        tr_list.append(tr)
-
-    def wilder_smooth(data, p):
-        s = sum(data[:p])
-        result = [s]
-        for v in data[p:]:
-            s = s - s/p + v
-            result.append(s)
-        return result
-
-    atr_s   = wilder_smooth(tr_list, period)
-    pdm_s   = wilder_smooth(plus_dm, period)
-    mdm_s   = wilder_smooth(minus_dm, period)
-
-    di_plus  = [100*p/a if a else 0 for p,a in zip(pdm_s, atr_s)]
-    di_minus = [100*m/a if a else 0 for m,a in zip(mdm_s, atr_s)]
-    dx = [100*abs(p-m)/(p+m) if (p+m) else 0 for p,m in zip(di_plus, di_minus)]
-
-    if len(dx) < period: return None
-    adx = sum(dx[:period])/period
-    for v in dx[period:]:
-        adx = (adx*(period-1)+v)/period
-
-    return {
-        "adx": round(adx, 2),
-        "di_plus": round(di_plus[-1], 2),
-        "di_minus": round(di_minus[-1], 2),
-    }
-
-
-def calc_vwap(candles):
-    """VWAP — volume weighted average price (intraday fair value)."""
-    vols = get_volumes(candles)
-    cl   = get_closes(candles)
-    hi   = get_highs(candles)
-    lo   = get_lows(candles)
-
-    total_pv = 0; total_v = 0
-    for i in range(len(candles)):
-        typical = (hi[i]+lo[i]+cl[i])/3
-        v = vols[i] if vols[i] > 0 else 1
-        total_pv += typical * v
-        total_v  += v
-
-    vwap = total_pv / total_v if total_v else cl[0]
-    cur  = cl[0]
-    diff_pct = ((cur - vwap) / vwap * 100) if vwap else 0
-    return {"vwap": round(vwap, 6), "cur": round(cur, 6), "diff_pct": round(diff_pct, 4)}
-
-
-def calc_support_resistance(candles, lookback=50):
-    """
-    Finds key support/resistance levels using recent swing highs/lows.
-    Returns nearest support below and resistance above current price.
-    """
-    if len(candles) < 10: return None
-    hi = get_highs(candles[:lookback])
-    lo = get_lows(candles[:lookback])
-    cl = get_closes(candles)
-    cur = cl[0]
-
-    # Find swing highs (local maxima) and lows (local minima)
-    swing_highs, swing_lows = [], []
-    for i in range(2, len(hi)-2):
-        if hi[i] > hi[i-1] and hi[i] > hi[i-2] and hi[i] > hi[i+1] and hi[i] > hi[i+2]:
-            swing_highs.append(hi[i])
-        if lo[i] < lo[i-1] and lo[i] < lo[i-2] and lo[i] < lo[i+1] and lo[i] < lo[i+2]:
-            swing_lows.append(lo[i])
-
-    # Nearest resistance above price
-    resistances = [h for h in swing_highs if h > cur]
-    resistance  = min(resistances) if resistances else max(hi)
-
-    # Nearest support below price
-    supports = [l for l in swing_lows if l < cur]
-    support  = max(supports) if supports else min(lo)
-
-    dist_to_res = ((resistance - cur) / cur * 100) if cur else 0
-    dist_to_sup = ((cur - support) / cur * 100) if cur else 0
-
-    return {
-        "support":     round(support, 6),
-        "resistance":  round(resistance, 6),
-        "dist_to_res": round(dist_to_res, 4),
-        "dist_to_sup": round(dist_to_sup, 4),
-        "cur":         round(cur, 6),
-    }
-
-
-# ── Scoring engine ────────────────────────────────────────────────────────────
-# Max scores per indicator:
-#   RSI:        ±3
-#   MACD:       ±4 (with crossover bonus)
-#   EMA stack:  ±3
-#   BB:         ±2
-#   Stoch:      ±2
-#   ATR:        ±1 (filter only)
-#   ADX:        ±2 (trend strength bonus)
-#   VWAP:       ±2
-#   S/R:        ±2
-# Total max per TF: ~±21
-
-def score_timeframe(candles):
-    score = 0
-    details = {}
-    cl = get_closes(candles)
-
-    # ── RSI ──────────────────────────────────────────────────────────────────
-    rsi = calc_rsi(cl)
-    if rsi is not None:
-        if rsi <= 20:    score += 3; lbl = f"Extremely oversold ({rsi}) 🔥"
-        elif rsi <= 30:  score += 2; lbl = f"Oversold ({rsi})"
-        elif rsi <= 44:  score += 1; lbl = f"Mild bullish ({rsi})"
-        elif rsi >= 80:  score -= 3; lbl = f"Extremely overbought ({rsi}) 🔥"
-        elif rsi >= 70:  score -= 2; lbl = f"Overbought ({rsi})"
-        elif rsi >= 56:  score -= 1; lbl = f"Mild bearish ({rsi})"
-        else:                        lbl = f"Neutral ({rsi})"
-        details["rsi"] = {"value": rsi, "label": lbl}
-
-    # ── MACD ─────────────────────────────────────────────────────────────────
-    macd_res = calc_macd(cl)
-    if macd_res:
-        ml, sl, hist, prev = macd_res
-        cup   = ml > sl and prev <= sl
-        cdown = ml < sl and prev >= sl
-        if ml > sl:
-            base = 3 if abs(hist) > 0.00005 else 1
-            score += base + (1 if cup else 0)
-            lbl = "Fresh bullish crossover ✅" if cup else ("Strong bullish" if base == 3 else "Bullish")
+    m=macd(cl)
+    if m:
+        ml,sl,hist,prev=m; cup=ml>sl and prev<=sl; cdn=ml<sl and prev>=sl
+        if ml>sl:
+            b=3 if abs(hist)>0.00005 else 1; sc+=b+(1 if cup else 0)
+            lbl="FreshBullX✅" if cup else ("StrongBull" if b==3 else "Bull")
         else:
-            base = 3 if abs(hist) > 0.00005 else 1
-            score -= base + (1 if cdown else 0)
-            lbl = "Fresh bearish crossover ❌" if cdown else ("Strong bearish" if base == 3 else "Bearish")
-        details["macd"] = {"label": lbl}
+            b=3 if abs(hist)>0.00005 else 1; sc-=b+(1 if cdn else 0)
+            lbl="FreshBearX❌" if cdn else ("StrongBear" if b==3 else "Bear")
+        det["macd"]=lbl
 
-    # ── EMA Triple Stack ─────────────────────────────────────────────────────
-    e9, e21, e50 = calc_ema(cl, 9), calc_ema(cl, 21), calc_ema(cl, 50)
+    e9,e21,e50=ema(cl,9),ema(cl,21),ema(cl,50)
     if e9 and e21 and e50:
-        if e9 > e21 > e50:    score += 3; lbl = "Bull stack 9>21>50 ✅"
-        elif e9 > e21:        score += 1; lbl = "Bullish (9>21)"
-        elif e9 < e21 < e50:  score -= 3; lbl = "Bear stack 9<21<50 ❌"
-        elif e9 < e21:        score -= 1; lbl = "Bearish (9<21)"
-        else:                             lbl = "Mixed EMAs"
-        details["ema"] = {"label": lbl}
+        if e9>e21>e50:   sc+=3;lbl="Bull9>21>50✅"
+        elif e9>e21:     sc+=1;lbl="Bull(9>21)"
+        elif e9<e21<e50: sc-=3;lbl="Bear9<21<50❌"
+        elif e9<e21:     sc-=1;lbl="Bear(9<21)"
+        else:                  lbl="Mixed"
+        det["ema"]=lbl
 
-    # ── Bollinger Bands ───────────────────────────────────────────────────────
-    bb = calc_bollinger(cl)
+    bb=bollinger(cl)
     if bb:
-        pb, bw = bb["pct_b"], bb["bw"]
-        if bw < 0.001:   score -= 1; lbl = "Squeeze — avoid ⚠️"
-        elif pb <= 0.05: score += 2; lbl = "At lower band — buy zone 🔥"
-        elif pb <= 0.2:  score += 1; lbl = "Near lower band"
-        elif pb >= 0.95: score -= 2; lbl = "At upper band — sell zone 🔥"
-        elif pb >= 0.8:  score -= 1; lbl = "Near upper band"
-        else:                        lbl = f"Mid-band ({round(pb*100,1)}%)"
-        details["bb"] = {"label": lbl}
+        pb=bb["pct_b"]; bw=bb["bw"]
+        if bw<0.001:   sc-=1;lbl="Squeeze⚠️"
+        elif pb<=0.05: sc+=2;lbl="LowerBand🔥"
+        elif pb<=0.2:  sc+=1;lbl="NearLower"
+        elif pb>=0.95: sc-=2;lbl="UpperBand🔥"
+        elif pb>=0.8:  sc-=1;lbl="NearUpper"
+        else:               lbl=f"Mid({round(pb*100)}%)"
+        det["bb"]=lbl
 
-    # ── Stochastic ────────────────────────────────────────────────────────────
-    stoch = calc_stochastic(candles)
-    if stoch:
-        k, d, pk = stoch["k"], stoch["d"], stoch["prev_k"]
-        cu = k > d and pk <= d
-        cd = k < d and pk >= d
-        if k < 20 and d < 20:    score += 2; lbl = f"Oversold K={k} D={d} 🔥"
-        elif k < 20:             score += 1; lbl = f"Oversold zone K={k}"
-        elif k > 80 and d > 80:  score -= 2; lbl = f"Overbought K={k} D={d} 🔥"
-        elif k > 80:             score -= 1; lbl = f"Overbought K={k}"
-        elif cu:                 score += 1; lbl = f"Bullish cross K={k}"
-        elif cd:                 score -= 1; lbl = f"Bearish cross K={k}"
-        else:                                lbl = f"Neutral K={k} D={d}"
-        details["stoch"] = {"label": lbl}
+    st=stochastic(c)
+    if st:
+        k,d,pk=st["k"],st["d"],st["pk"]
+        cu=k>d and pk<=d; cd=k<d and pk>=d
+        if k<20 and d<20:   sc+=2;lbl=f"Oversold🔥"
+        elif k<20:          sc+=1;lbl=f"OversoldK={k}"
+        elif k>80 and d>80: sc-=2;lbl=f"Overbought🔥"
+        elif k>80:          sc-=1;lbl=f"OverboughtK={k}"
+        elif cu:            sc+=1;lbl=f"BullX K={k}"
+        elif cd:            sc-=1;lbl=f"BearX K={k}"
+        else:                    lbl=f"Neutral"
+        det["stoch"]=lbl
 
-    # ── ATR — Volatility Filter ───────────────────────────────────────────────
-    atr_res = calc_atr(candles)
-    if atr_res:
-        ap = atr_res["atr_pct"]
-        if ap < 0.005:   score -= 1; lbl = f"Extremely low volatility ({ap}%) ⚠️"
-        elif ap > 0.5:   score -= 1; lbl = f"Very high volatility ({ap}%) ⚠️"
-        else:            score += 1; lbl = f"Good volatility ({ap}%) ✅"
-        details["atr"] = {"label": lbl}
+    ap=atr(c)
+    if ap is not None:
+        if ap<0.005:   sc-=1;lbl="LowVol⚠️"
+        elif ap>0.5:   sc-=1;lbl="HighVol⚠️"
+        else:          sc+=1;lbl=f"GoodVol✅"
+        det["atr"]=lbl
 
-    # ── ADX — Trend Strength ──────────────────────────────────────────────────
-    adx_res = calc_adx(candles)
-    if adx_res:
-        adx = adx_res["adx"]
-        dip = adx_res["di_plus"]
-        dim = adx_res["di_minus"]
-        if adx >= 30 and dip > dim:   score += 2; lbl = f"Strong uptrend ADX={adx} 💪"
-        elif adx >= 25 and dip > dim: score += 1; lbl = f"Uptrend ADX={adx}"
-        elif adx >= 30 and dim > dip: score -= 2; lbl = f"Strong downtrend ADX={adx} 💪"
-        elif adx >= 25 and dim > dip: score -= 1; lbl = f"Downtrend ADX={adx}"
-        elif adx < 20:                            score += 0; lbl = f"Ranging ADX={adx} (neutral)"
-        else:                                     lbl = f"Moderate trend ADX={adx}"
-        details["adx"] = {"label": lbl}
+    ad=adx(c)
+    if ad:
+        a,dip,dim=ad["adx"],ad["dip"],ad["dim"]
+        if a>=30 and dip>dim:   sc+=2;lbl=f"StrongUp💪"
+        elif a>=25 and dip>dim: sc+=1;lbl=f"Uptrend"
+        elif a>=30 and dim>dip: sc-=2;lbl=f"StrongDown💪"
+        elif a>=25 and dim>dip: sc-=1;lbl=f"Downtrend"
+        else:                        lbl=f"Ranging"
+        det["adx"]=lbl
 
-    # ── VWAP — Fair Value ─────────────────────────────────────────────────────
-    vwap_res = calc_vwap(candles)
-    if vwap_res:
-        dp = vwap_res["diff_pct"]
-        if dp <= -0.1:   score += 2; lbl = f"Price below VWAP — buy zone ✅"
-        elif dp <= -0.03:score += 1; lbl = f"Slightly below VWAP"
-        elif dp >= 0.1:  score -= 2; lbl = f"Price above VWAP — sell zone ✅"
-        elif dp >= 0.03: score -= 1; lbl = f"Slightly above VWAP"
-        else:                        lbl = f"At VWAP — fair value"
-        details["vwap"] = {"label": lbl}
+    vd=vwap(c)
+    if vd<=-0.1:   sc+=2;lbl="BelowVWAP✅"
+    elif vd<=-0.03:sc+=1;lbl="SlightBelow"
+    elif vd>=0.1:  sc-=2;lbl="AboveVWAP✅"
+    elif vd>=0.03: sc-=1;lbl="SlightAbove"
+    else:               lbl="AtVWAP"
+    det["vwap"]=lbl
 
-    # ── Support & Resistance ──────────────────────────────────────────────────
-    sr = calc_support_resistance(candles)
+    sr=snr(c)
     if sr:
-        dtr = sr["dist_to_res"]
-        dts = sr["dist_to_sup"]
-        if dts < 0.05:   score += 2; lbl = f"At support {sr['support']} 🔥"
-        elif dts < 0.15: score += 1; lbl = f"Near support {sr['support']}"
-        elif dtr < 0.05: score -= 2; lbl = f"At resistance {sr['resistance']} 🔥"
-        elif dtr < 0.15: score -= 1; lbl = f"Near resistance {sr['resistance']}"
-        else:                        lbl = f"S: {sr['support']} | R: {sr['resistance']}"
-        details["sr"] = {"label": lbl}
+        if sr["dts"]<0.05:   sc+=2;lbl=f"AtSupport🔥"
+        elif sr["dts"]<0.15: sc+=1;lbl=f"NearSupport"
+        elif sr["dtr"]<0.05: sc-=2;lbl=f"AtResist🔥"
+        elif sr["dtr"]<0.15: sc-=1;lbl=f"NearResist"
+        else:                     lbl=f"S:{sr['sup']}|R:{sr['res']}"
+        det["sr"]=lbl
 
-    return {"score": score, "details": details, "error": False}
+    return {"score":sc,"det":det,"error":False}
 
 
-async def analyse_pair(pair, duration):
-    tf_list = TIMEFRAMES[duration]
-    tasks = [fetch_candles(pair, iv, 120) for iv, _ in tf_list]
-    candle_sets = await asyncio.gather(*tasks)
+async def analyse(pair, duration):
+    tfl=TIMEFRAMES[duration]
+    sets=await asyncio.gather(*[fetch(pair,iv,120) for iv,_ in tfl])
+    results={}; total=0; any_data=False
+    for (iv,lbl),c in zip(tfl,sets):
+        if not c or len(c)<50: results[lbl]={"error":True,"score":0,"det":{}}; continue
+        any_data=True; r=score_tf(c); results[lbl]=r; total+=r["score"]
+    if not any_data: return {"error":True,"message":"No market data. Check API key."}
 
-    tf_results = {}
-    total_score = 0
-    any_data = False
+    # Count individual indicator votes
+    bull=0; bear=0; total_i=0
+    for r in results.values():
+        if r.get("error"): continue
+        for lbl in r["det"].values():
+            total_i+=1; l=lbl.lower()
+            if any(x in l for x in ["oversold","bull","belowvwap","support","goodvol","freshbullx","strongup","uptrend","lowerband","nearsupp"]):
+                bull+=1
+            elif any(x in l for x in ["overbought","bear","abovevwap","resist","freshbearx","strongdown","downtrend","upperband","nearresist"]):
+                bear+=1
 
-    for (iv, label), candles in zip(tf_list, candle_sets):
-        if not candles or len(candles) < 50:
-            tf_results[label] = {"error": True, "score": 0, "details": {}}
-            continue
-        any_data = True
-        r = score_timeframe(candles)
-        tf_results[label] = r
-        total_score += r["score"]
+    if bull>=4 and bull>bear:    direction,emoji,sig="BUY","🟢","📈"
+    elif bear>=4 and bear>bull:  direction,emoji,sig="SELL","🔴","📉"
+    else:                        direction,emoji,sig="WAIT","🟡","⏳"
 
-    if not any_data:
-        return {"error": True, "message": "Could not fetch market data. Check your API key."}
-
-    scored = [r for r in tf_results.values() if not r.get("error")]
-    n = len(scored)
-
-    # Count bullish and bearish INDICATORS across all TFs (not just TF scores)
-    bull_inds = 0
-    bear_inds = 0
-    total_inds = 0
-    for r in scored:
-        for k, v in r["details"].items():
-            lbl = v["label"].lower()
-            total_inds += 1
-            if any(x in lbl for x in ["oversold","bull","below vwap","support","buy zone","uptrend","bullish cross","fresh bull","strong up"]):
-                bull_inds += 1
-            elif any(x in lbl for x in ["overbought","bear","above vwap","resistance","sell zone","downtrend","bearish cross","fresh bear","strong down"]):
-                bear_inds += 1
-
-    bulls = sum(1 for r in scored if r["score"] > 0)
-    bears = sum(1 for r in scored if r["score"] < 0)
-    bull_ratio = bulls / n if n else 0
-    bear_ratio = bears / n if n else 0
-    all_agree  = bulls == n or bears == n
-
-    strength = min(round(abs(total_score) / max(n * 21, 1) * 100), 95)
-
-    # Fire signal if 4+ indicators agree in same direction
-    if bull_inds >= 4 and bull_inds > bear_inds:
-        direction, emoji, sig = "BUY",  "🟢", "📈"
-    elif bear_inds >= 4 and bear_inds > bull_inds:
-        direction, emoji, sig = "SELL", "🔴", "📉"
-    else:
-        direction, emoji, sig = "WAIT", "🟡", "⏳"
-        strength = 0
-
-    return {
-        "error": False, "direction": direction, "emoji": emoji, "signal_emoji": sig,
-        "strength": strength, "total_score": total_score,
-        "all_agree": all_agree, "bull_ratio": bull_ratio, "bear_ratio": bear_ratio,
-        "bull_inds": bull_inds, "bear_inds": bear_inds, "total_inds": total_inds,
-        "tf_results": tf_results, "tfs": [lbl for _, lbl in tf_list],
-    }
+    pct=min(round(max(bull,bear)/max(total_i,1)*100),95)
+    tfs=[lbl for _,lbl in tfl]
+    return {"error":False,"direction":direction,"emoji":emoji,"sig":sig,
+            "pct":pct,"bull":bull,"bear":bear,"total_i":total_i,
+            "results":results,"tfs":tfs}
 
 
-# ── Formatter ─────────────────────────────────────────────────────────────────
+# ── Format ────────────────────────────────────────────────────────────────────
 
-INDICATOR_LABELS = {
-    "rsi": "RSI  ", "macd": "MACD ", "ema": "EMA  ",
-    "bb": "BB   ", "stoch": "STOCH", "atr": "ATR  ",
-    "adx": "ADX  ", "vwap": "VWAP ", "sr": "S/R  ",
-}
-
-def _ind_icon(key, label):
-    """Convert indicator label to a short emoji status."""
-    l = label.lower()
-    if any(x in l for x in ["oversold","bull","below vwap","support","buy zone","uptrend","bullish cross","fresh bull"]):
-        return "🟢"
-    if any(x in l for x in ["overbought","bear","above vwap","resistance","sell zone","downtrend","bearish cross","fresh bear"]):
-        return "🔴"
-    if any(x in l for x in ["squeeze","avoid","extreme","ranging"]):
-        return "⚠️"
+def icon(lbl):
+    l=lbl.lower()
+    if any(x in l for x in ["oversold","bull","belowvwap","support","goodvol","freshbullx","strongup","uptrend","lowerband","nearsupp"]): return "🟢"
+    if any(x in l for x in ["overbought","bear","abovevwap","resist","freshbearx","strongdown","downtrend","upperband","nearresist"]): return "🔴"
+    if any(x in l for x in ["squeeze","lowvol","highvol"]): return "⚠️"
     return "🟡"
 
-def format_signal(pair, duration, analysis):
-    now = datetime.utcnow().strftime("%H:%M  %d %b %Y")
-    lines = [
-        "╔══════════════════════╗",
-        "║  📊 QUOTEX SIGNALS   ║",
-        "╚══════════════════════╝",
-        f"💱 *{pair}*  ⏱ *{duration}*",
-        f"🕐 {now}", "",
-        "─── TIMEFRAME BREAKDOWN ───",
-    ]
+def fmt(pair, duration, a):
+    now=datetime.utcnow().strftime("%H:%M  %d %b %Y")
+    lines=["╔══════════════════════╗","║  📊 QUOTEX SIGNALS   ║","╚══════════════════════╝",
+           f"💱 *{pair}*  ⏱ *{duration}*",f"🕐 {now}","","─── TIMEFRAME BREAKDOWN ───"]
+    for tf in a["tfs"]:
+        r=a["results"].get(tf,{})
+        if r.get("error"): lines.append(f"*{tf}* ⚠️ No data"); continue
+        sc=r["score"]; bias="🟢" if sc>0 else ("🔴" if sc<0 else "🟡")
+        inds=" ".join(f"{icon(v)}{k.upper()}" for k,v in r["det"].items())
+        lines.append(f"*{tf}* {bias}`{sc:+d}`  {inds}")
+    fill=min(int(a["pct"]/10),10); bar="█"*fill+"░"*(10-fill)
+    lines+=["","──────────────────────────",""]
+    if a["direction"]=="WAIT":
+        lines+=["🟡 *WAIT ⏳*",
+                f"_🟢x{a['bull']} vs 🔴x{a['bear']} / {a['total_i']} indicators_",
+                "_Need 4+ to agree. Wait for better setup._"]
+    else:
+        lines+=[f"{a['emoji']} *{a['direction']} {a['sig']}*",
+                f"📶 Confidence: *{a['pct']}%*  `[{bar}]`",
+                f"🗳 Votes: 🟢x{a['bull']} vs 🔴x{a['bear']} / {a['total_i']}",
+                f"⏰ *Expiry: {get_expiry_time(duration)}*",
+                "_Enter at open of next candle_"]
+    lines+=["","⚠️ _Educational only. Trade responsibly._"]
+    return "\n".join(lines)
 
-    for tf in analysis["tfs"]:
-        r = analysis["tf_results"].get(tf, {})
-        if r.get("error"):
-            lines += [f"*{tf}* ⚠️ No data"]; continue
-        sc = r["score"]; d = r["details"]
-        bias = "🟢" if sc > 0 else ("🔴" if sc < 0 else "🟡")
 
-        # One line per indicator: ICON  NAME
-        ind_line = ""
-        for k in ["rsi","macd","ema","bb","stoch","atr","adx","vwap","sr"]:
-            if k in d:
-                icon = _ind_icon(k, d[k]["label"])
-                ind_line += f"{icon}{k.upper()} "
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
-        lines += [f"*{tf}* {bias} `{sc:+d}`  {ind_line.strip()}"]
+async def start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    kb=[[InlineKeyboardButton("📊 Generate Signal",callback_data="new_signal")]]
+    await update.message.reply_text(
+        "👋 Welcome to *Chima Dtrader Ai*!\n\n"
+        "🧠 *9 indicators × 3 timeframes:*\n"
+        "RSI • MACD • EMA • BB • Stoch\n"
+        "ATR • ADX • VWAP • Support/Resistance\n\n"
+        "⚡ Signal fires when 4+ indicators agree\n"
+        "⏰ Includes trade expiry time\n\n"
+        "Tap below 👇",
+        reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
 
-    pct  = analysis["strength"]
-    fill = min(int(pct/10), 10)
-    bar  = "█"*fill + "░"*(10-fill)
+async def new_signal(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    kb=[[InlineKeyboardButton(p,callback_data=f"pair_{p}") for p in row] for row in FOREX_PAIRS]
+    await q.edit_message_text("💱 *Select a Forex pair:*",reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+    return SELECT_PAIR
 
-    lines += ["", "──────────────────────────", ""]
+async def pair_selected(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    pair=q.data.replace("pair_",""); ctx.user_data["pair"]=pair
+    kb=[[InlineKeyboardButton(d,callback_data=f"dur_{d}")] for d in DURATIONS]
+    kb.append([InlineKeyboardButton("🔙 Back",callback_data="new_signal")])
+    await q.edit_message_text(f"✅ *{pair}* selected\n\n⏱ *Select duration:*",
+                              reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+    return SELECT_DURATION
 
-    bull_inds = analysis.get("bull_inds", 0)
-    bear_inds = analysis.get("bear_inds", 0)
-    total_i
+async def dur_selected(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    dur=q.data.replace("dur_",""); pair=ctx.user_data.get("pair","EUR/USD")
+    await q.edit_message_text(f"📡 Fetching *{pair}* data...\n🧠 Running 9 indicators × 3 TFs ⏳",parse_mode="Markdown")
+    a=await analyse(pair,dur)
+    kb=[[InlineKeyboardButton("🔄 Refresh",callback_data=f"dur_{dur}"),
+         InlineKeyboardButton("💱 New Pair",callback_data="new_signal")]]
+    if a.get("error"):
+        await q.edit_message_text(f"⚠️ *Error:* {a['message']}",parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(kb)); return SELECT_DURATION
+    await q.edit_message_text(fmt(pair,dur,a),parse_mode="Markdown",
+                              reply_markup=InlineKeyboardMarkup(kb))
+    return SELECT_DURATION
+
+async def help_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Chima Dtrader Ai — How it works*\n\n"
+        "1️⃣ Select pair → 2️⃣ Select duration\n"
+        "3️⃣ Live candles fetched\n"
+        "4️⃣ 9 indicators × 3 TFs calculated\n"
+        "5️⃣ Signal fires when 4+ agree\n"
+        "6️⃣ Expiry time shown\n\n"
+        "⚠️ _Educational only._",parse_mode="Markdown")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=== CHIMA DTRADER AI STARTING ===")
+    print(f"TOKEN: {'SET' if TOKEN else 'MISSING!'}")
+    print(f"API KEY: {'SET' if TD_API_KEY else 'MISSING!'}")
+    if not TOKEN: print("ERROR: Set TELEGRAM_BOT_TOKEN in Render Environment"); sys.exit(1)
+
+    app=Application.builder().token(TOKEN).build()
+    conv=ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_signal,pattern="^new_signal$")],
+        states={
+            SELECT_PAIR:[CallbackQueryHandler(pair_selected,pattern="^pair_")],
+            SELECT_DURATION:[CallbackQueryHandler(dur_selected,pattern="^dur_"),
+                             CallbackQueryHandler(new_signal,pattern="^new_signal$")],
+        },
+        fallbacks=[CommandHandler("start",start)],per_message=False)
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("help",help_cmd))
+    app.add_handler(conv)
+    print("🤖 Bot polling started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__=="__main__":
+    port=int(os.environ.get("PORT",8080))
+    flask_app=Flask(__name__)
+
+    @flask_app.route("/")
+    def index(): return "Chima Dtrader Ai is running."
+
+    t=threading.Thread(target=lambda:flask_app.run(host="0.0.0.0",port=port,use_reloader=False),daemon=True)
+    t.start()
+    main()
