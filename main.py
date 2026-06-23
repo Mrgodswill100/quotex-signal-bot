@@ -13,11 +13,7 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 if __name__ == "__main__":
-    # Start Flask in background thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-
-    # Run bot in main thread (owns the event loop)
     from bot import main as run_bot
     run_bot()
-    
