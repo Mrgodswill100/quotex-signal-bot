@@ -17,26 +17,42 @@ FOREX_PAIRS = [
     ["AUD/CAD","AUD/CHF","AUD/NZD","NZD/CAD"],
     ["USD/SGD","USD/MXN","USD/ZAR","USD/NOK"],
 ]
-DURATIONS = ["1 min","5 min","15 min","30 min","1 hour"]
+
+DURATIONS = ["15 sec","30 sec","1 min","5 min","15 min","30 min"]
+
+# entry TF, confirmation TF, trend TF
 TIMEFRAMES = {
-    "1 min":  [("1min","M1"),("5min","M5"),("15min","M15")],
-    "5 min":  [("5min","M5"),("15min","M15"),("1h","H1")],
-    "15 min": [("15min","M15"),("1h","H1"),("4h","H4")],
-    "30 min": [("30min","M30"),("1h","H1"),("4h","H4")],
-    "1 hour": [("1h","H1"),("4h","H4"),("1day","D1")],
+    "15 sec":  [("1min","M1"), ("5min","M5"),  ("15min","M15")],
+    "30 sec":  [("1min","M1"), ("5min","M5"),  ("15min","M15")],
+    "1 min":   [("1min","M1"), ("5min","M5"),  ("15min","M15")],
+    "5 min":   [("5min","M5"),  ("15min","M15"),("30min","M30")],
+    "15 min":  [("15min","M15"),("30min","M30"),("1h","H1")],
+    "30 min":  [("30min","M30"),("1h","H1"),   ("4h","H4")],
 }
-DURATION_MINUTES = {"1 min":1,"5 min":5,"15 min":15,"30 min":30,"1 hour":60}
+
+DURATION_MINUTES = {
+    "15 sec": 0.25, "30 sec": 0.5,
+    "1 min": 1, "5 min": 5, "15 min": 15, "30 min": 30
+}
+
 SELECT_PAIR, SELECT_DURATION = range(2)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_expiry_time(duration):
-    mins = DURATION_MINUTES.get(duration, 5)
-    expiry = datetime.utcnow().replace(second=0, microsecond=0) + timedelta(minutes=mins+1)
+def get_expiry(duration):
+    mins = DURATION_MINUTES.get(duration, 1)
+    expiry = datetime.utcnow().replace(second=0, microsecond=0) + timedelta(minutes=mins + 1)
+    if mins < 1:
+        secs = int(mins * 60)
+        expiry = datetime.utcnow() + timedelta(seconds=secs + 5)
+        return expiry.strftime("%H:%M:%S UTC")
     return expiry.strftime("%H:%M UTC")
 
-def fetch_sync(pair, interval, size=100):
-    p = urllib.parse.urlencode({"symbol":pair,"interval":interval,"outputsize":size,"apikey":TD_API_KEY,"format":"JSON"})
+def fetch_sync(pair, interval, size=150):
+    p = urllib.parse.urlencode({
+        "symbol": pair, "interval": interval,
+        "outputsize": size, "apikey": TD_API_KEY, "format": "JSON"
+    })
     try:
         with urllib.request.urlopen(f"{TD_BASE}/time_series?{p}", timeout=20) as r:
             d = json.loads(r.read().decode())
@@ -44,323 +60,361 @@ def fetch_sync(pair, interval, size=100):
     except:
         return None
 
-async def fetch(pair, interval, size=100):
+async def fetch(pair, interval, size=150):
     return await asyncio.get_event_loop().run_in_executor(None, fetch_sync, pair, interval, size)
 
-def closes(c): return [float(x["close"]) for x in c]
-def highs(c):  return [float(x["high"])  for x in c]
-def lows(c):   return [float(x["low"])   for x in c]
-def vols(c):
-    try: return [float(x.get("volume",1)) for x in c]
-    except: return [1.0]*len(c)
+def C(c): return [float(x["close"]) for x in c]
+def H(c): return [float(x["high"])  for x in c]
+def L(c): return [float(x["low"])   for x in c]
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 
-def rsi(prices, p=14):
-    if len(prices)<p+1: return None
-    pr=list(reversed(prices))
-    g=[max(pr[i]-pr[i-1],0) for i in range(1,p+1)]
-    l=[max(pr[i-1]-pr[i],0) for i in range(1,p+1)]
-    ag,al=sum(g)/p,sum(l)/p
-    for i in range(p+1,len(pr)):
-        d=pr[i]-pr[i-1]; ag=(ag*(p-1)+max(d,0))/p; al=(al*(p-1)+max(-d,0))/p
-    return round(100-(100/(1+ag/al)),2) if al else 100.0
+def calc_rsi(cl, p=14):
+    if len(cl) < p+1: return None
+    pr = list(reversed(cl))
+    g = [max(pr[i]-pr[i-1],0) for i in range(1,p+1)]
+    l = [max(pr[i-1]-pr[i],0) for i in range(1,p+1)]
+    ag,al = sum(g)/p, sum(l)/p
+    for i in range(p+1, len(pr)):
+        d = pr[i]-pr[i-1]
+        ag = (ag*(p-1)+max(d,0))/p
+        al = (al*(p-1)+max(-d,0))/p
+    return round(100-(100/(1+ag/al)), 2) if al else 100.0
 
-def ema(prices, p):
-    if len(prices)<p: return None
-    pr=list(reversed(prices)); k=2/(p+1); e=sum(pr[:p])/p
-    for x in pr[p:]: e=x*k+e*(1-k)
-    return round(e,6)
+def calc_ema(cl, p):
+    if len(cl) < p: return None
+    pr = list(reversed(cl))
+    k = 2/(p+1); e = sum(pr[:p])/p
+    for x in pr[p:]: e = x*k + e*(1-k)
+    return round(e, 6)
 
-def macd(prices):
-    if len(prices)<35: return None
-    pr=list(reversed(prices)); k12,k26,k9=2/13,2/27,2/10
-    e12=sum(pr[:12])/12; e26=sum(pr[:26])/26; ms=[]
+def calc_macd(cl):
+    if len(cl) < 35: return None
+    pr = list(reversed(cl))
+    k12,k26,k9 = 2/13,2/27,2/10
+    e12 = sum(pr[:12])/12; e26 = sum(pr[:26])/26; ms = []
     for i in range(26,len(pr)):
         e12=pr[i]*k12+e12*(1-k12); e26=pr[i]*k26+e26*(1-k26); ms.append(e12-e26)
     if len(ms)<9: return None
-    sig=sum(ms[:9])/9
-    for v in ms[9:]: sig=v*k9+sig*(1-k9)
-    ml=ms[-1]; prev=ms[-2] if len(ms)>=2 else ml
-    return round(ml,6),round(sig,6),round(ml-sig,6),prev
+    sig = sum(ms[:9])/9
+    for v in ms[9:]: sig = v*k9+sig*(1-k9)
+    ml = ms[-1]; prev = ms[-2] if len(ms)>=2 else ml
+    return ml, sig, ml-sig, prev
 
-def bollinger(prices, p=20):
-    if len(prices)<p: return None
-    w=[float(x) for x in prices[:p]]; mid=sum(w)/p
-    std=(sum((x-mid)**2 for x in w)/p)**0.5
-    up,lo=mid+2*std,mid-2*std; cur=prices[0]
-    pb=(cur-lo)/(up-lo) if up!=lo else 0.5
-    return {"pct_b":round(pb,4),"bw":round((up-lo)/mid if mid else 0,6)}
-
-def stochastic(c, kp=14, dp=3):
-    if len(c)<kp+dp: return None
-    cl,hi,lo=closes(c),highs(c),lows(c); kv=[]
+def calc_stoch(c, kp=14, dp=3):
+    cl,hi,lo = C(c),H(c),L(c)
+    if len(c) < kp+dp: return None
+    kv = []
     for i in range(dp+1):
-        wh,wl=max(hi[i:i+kp]),min(lo[i:i+kp])
+        wh,wl = max(hi[i:i+kp]),min(lo[i:i+kp])
         kv.append(100*(cl[i]-wl)/(wh-wl) if wh!=wl else 50.0)
-    return {"k":round(kv[0],2),"d":round(sum(kv[:dp])/dp,2),"pk":kv[1]}
+    return kv[0], sum(kv[:dp])/dp, kv[1]
 
-def atr(c, p=14):
+def calc_bb(cl, p=20):
+    if len(cl)<p: return None
+    w = cl[:p]; mid = sum(w)/p
+    std = (sum((x-mid)**2 for x in w)/p)**0.5
+    up,lo = mid+2*std, mid-2*std
+    pb = (cl[0]-lo)/(up-lo) if up!=lo else 0.5
+    bw = (up-lo)/mid if mid else 0
+    return round(pb,4), round(bw,6)
+
+def calc_atr(c, p=14):
+    cl,hi,lo = C(c),H(c),L(c)
     if len(c)<p+1: return None
-    cl,hi,lo=closes(c),highs(c),lows(c)
-    trs=[max(hi[i]-lo[i],abs(hi[i]-cl[i+1]),abs(lo[i]-cl[i+1])) for i in range(p)]
-    a=sum(trs)/p
-    return round((a/cl[0])*100,4) if cl[0] else 0
+    trs = [max(hi[i]-lo[i],abs(hi[i]-cl[i+1]),abs(lo[i]-cl[i+1])) for i in range(p)]
+    return sum(trs)/p
 
-def adx(c, p=14):
-    if len(c)<p*2: return None
-    hi=list(reversed(highs(c))); lo=list(reversed(lows(c))); cl=list(reversed(closes(c)))
-    pdm,mdm,trl=[],[],[]
-    for i in range(1,len(hi)):
-        hd=hi[i]-hi[i-1]; ld=lo[i-1]-lo[i]
-        pdm.append(hd if hd>ld and hd>0 else 0)
-        mdm.append(ld if ld>hd and ld>0 else 0)
-        trl.append(max(hi[i]-lo[i],abs(hi[i]-cl[i-1]),abs(lo[i]-cl[i-1])))
-    def ws(d,p):
-        s=sum(d[:p]); r=[s]
-        for v in d[p:]: s=s-s/p+v; r.append(s)
-        return r
-    at=ws(trl,p); pd=ws(pdm,p); md=ws(mdm,p)
-    dip=[100*a/b if b else 0 for a,b in zip(pd,at)]
-    dim=[100*a/b if b else 0 for a,b in zip(md,at)]
-    dx=[100*abs(a-b)/(a+b) if (a+b) else 0 for a,b in zip(dip,dim)]
-    if len(dx)<p: return None
-    adxv=sum(dx[:p])/p
-    for v in dx[p:]: adxv=(adxv*(p-1)+v)/p
-    return {"adx":round(adxv,2),"dip":round(dip[-1],2),"dim":round(dim[-1],2)}
+# ── Core signal logic ─────────────────────────────────────────────────────────
+#
+# GATEKEEPER RULES (all must pass or signal = WAIT):
+#   1. Trend TF (3rd TF) EMA 9/21 must define clear direction
+#   2. MACD on entry TF must agree with trend
+#   3. RSI must not be against direction (no BUY when RSI>65, no SELL when RSI<35)
+#
+# SCORING: once gatekeepers pass, count confirming indicators
+#   Need 4+ out of 7 to fire signal
 
-def vwap(c):
-    cl,hi,lo,vs=closes(c),highs(c),lows(c),vols(c)
-    tpv=sum(((hi[i]+lo[i]+cl[i])/3)*(vs[i] if vs[i]>0 else 1) for i in range(len(c)))
-    tv=sum(vs[i] if vs[i]>0 else 1 for i in range(len(c)))
-    v=tpv/tv if tv else cl[0]
-    return round(((cl[0]-v)/v*100),4) if v else 0
+def analyse_tf(c):
+    cl = C(c)
+    result = {}
 
-def snr(c, lb=50):
-    if len(c)<10: return None
-    hi=highs(c[:lb]); lo=lows(c[:lb]); cl=closes(c)
-    cur=cl[0]; sh,sl=[],[]
-    for i in range(2,min(len(hi),lb)-2):
-        if hi[i]>hi[i-1] and hi[i]>hi[i-2] and hi[i]>hi[i+1] and hi[i]>hi[i+2]: sh.append(hi[i])
-        if lo[i]<lo[i-1] and lo[i]<lo[i-2] and lo[i]<lo[i+1] and lo[i]<lo[i+2]: sl.append(lo[i])
-    res=min((h for h in sh if h>cur),default=max(hi))
-    sup=max((l for l in sl if l<cur),default=min(lo))
-    return {"sup":round(sup,6),"res":round(res,6),
-            "dtr":round((res-cur)/cur*100,4),"dts":round((cur-sup)/cur*100,4)}
-
-# ── Score ─────────────────────────────────────────────────────────────────────
-
-def score_tf(c):
-    sc=0; det={}; cl=closes(c)
-
-    v=rsi(cl)
-    if v is not None:
-        if v<=20:   sc+=3;lbl=f"Oversold({v})🔥"
-        elif v<=44: sc+=1;lbl=f"Mild bull({v})"
-        elif v>=80: sc-=3;lbl=f"Overbought({v})🔥"
-        elif v>=56: sc-=1;lbl=f"Mild bear({v})"
-        else:           lbl=f"Neutral({v})"
-        det["rsi"]=lbl
-
-    m=macd(cl)
-    if m:
-        ml,sl,hist,prev=m; cup=ml>sl and prev<=sl; cdn=ml<sl and prev>=sl
-        if ml>sl:
-            b=3 if abs(hist)>0.00005 else 1; sc+=b+(1 if cup else 0)
-            lbl="FreshBullX✅" if cup else ("StrongBull" if b==3 else "Bull")
-        else:
-            b=3 if abs(hist)>0.00005 else 1; sc-=b+(1 if cdn else 0)
-            lbl="FreshBearX❌" if cdn else ("StrongBear" if b==3 else "Bear")
-        det["macd"]=lbl
-
-    e9,e21,e50=ema(cl,9),ema(cl,21),ema(cl,50)
+    # EMA trend
+    e9  = calc_ema(cl, 9)
+    e21 = calc_ema(cl, 21)
+    e50 = calc_ema(cl, 50)
     if e9 and e21 and e50:
-        if e9>e21>e50:   sc+=3;lbl="Bull9>21>50✅"
-        elif e9>e21:     sc+=1;lbl="Bull(9>21)"
-        elif e9<e21<e50: sc-=3;lbl="Bear9<21<50❌"
-        elif e9<e21:     sc-=1;lbl="Bear(9<21)"
-        else:                  lbl="Mixed"
-        det["ema"]=lbl
+        if e9 > e21 > e50:   result["ema"] = ("bull", 2)
+        elif e9 > e21:       result["ema"] = ("bull", 1)
+        elif e9 < e21 < e50: result["ema"] = ("bear", 2)
+        elif e9 < e21:       result["ema"] = ("bear", 1)
+        else:                result["ema"] = ("neutral", 0)
+    result["ema_raw"] = (e9, e21, e50)
 
-    bb=bollinger(cl)
-    if bb:
-        pb=bb["pct_b"]; bw=bb["bw"]
-        if bw<0.001:   sc-=1;lbl="Squeeze⚠️"
-        elif pb<=0.05: sc+=2;lbl="LowerBand🔥"
-        elif pb<=0.2:  sc+=1;lbl="NearLower"
-        elif pb>=0.95: sc-=2;lbl="UpperBand🔥"
-        elif pb>=0.8:  sc-=1;lbl="NearUpper"
-        else:               lbl=f"Mid({round(pb*100)}%)"
-        det["bb"]=lbl
+    # MACD
+    m = calc_macd(cl)
+    if m:
+        ml,sl,hist,prev = m
+        cup  = ml>sl and prev<=sl
+        cdown= ml<sl and prev>=sl
+        if ml > sl:
+            strength = 2 if abs(hist)>0.00003 else 1
+            result["macd"] = ("bull", strength + (1 if cup else 0), "FreshX✅" if cup else ("Strong" if strength==2 else "Bull"))
+        else:
+            strength = 2 if abs(hist)>0.00003 else 1
+            result["macd"] = ("bear", strength + (1 if cdown else 0), "FreshX❌" if cdown else ("Strong" if strength==2 else "Bear"))
 
-    st=stochastic(c)
+    # RSI
+    r = calc_rsi(cl)
+    if r is not None:
+        if r <= 25:    result["rsi"] = ("bull", 2, f"Oversold({r})🔥")
+        elif r <= 44:  result["rsi"] = ("bull", 1, f"MildBull({r})")
+        elif r >= 75:  result["rsi"] = ("bear", 2, f"Overbought({r})🔥")
+        elif r >= 56:  result["rsi"] = ("bear", 1, f"MildBear({r})")
+        else:          result["rsi"] = ("neutral", 0, f"Neutral({r})")
+        result["rsi_val"] = r
+
+    # Stochastic
+    st = calc_stoch(c)
     if st:
-        k,d,pk=st["k"],st["d"],st["pk"]
-        cu=k>d and pk<=d; cd=k<d and pk>=d
-        if k<20 and d<20:   sc+=2;lbl=f"Oversold🔥"
-        elif k<20:          sc+=1;lbl=f"OversoldK={k}"
-        elif k>80 and d>80: sc-=2;lbl=f"Overbought🔥"
-        elif k>80:          sc-=1;lbl=f"OverboughtK={k}"
-        elif cu:            sc+=1;lbl=f"BullX K={k}"
-        elif cd:            sc-=1;lbl=f"BearX K={k}"
-        else:                    lbl=f"Neutral"
-        det["stoch"]=lbl
+        k,d,pk = st
+        cu = k>d and pk<=d; cd = k<d and pk>=d
+        if k<20 and d<20:    result["stoch"] = ("bull", 2, f"Oversold🔥")
+        elif k<25:           result["stoch"] = ("bull", 1, f"OvSold({round(k,1)})")
+        elif k>80 and d>80:  result["stoch"] = ("bear", 2, f"Overbought🔥")
+        elif k>75:           result["stoch"] = ("bear", 1, f"OvBought({round(k,1)})")
+        elif cu:             result["stoch"] = ("bull", 1, f"BullX")
+        elif cd:             result["stoch"] = ("bear", 1, f"BearX")
+        else:                result["stoch"] = ("neutral", 0, f"Neutral")
 
-    ap=atr(c)
-    if ap is not None:
-        if ap<0.005:   sc-=1;lbl="LowVol⚠️"
-        elif ap>0.5:   sc-=1;lbl="HighVol⚠️"
-        else:          sc+=1;lbl=f"GoodVol✅"
-        det["atr"]=lbl
+    # Bollinger Bands
+    bb = calc_bb(cl)
+    if bb:
+        pb,bw = bb
+        if bw < 0.0008:      result["bb"] = ("neutral", 0, "Squeeze⚠️")
+        elif pb <= 0.05:     result["bb"] = ("bull", 2, "LowerBand🔥")
+        elif pb <= 0.25:     result["bb"] = ("bull", 1, "NearLower")
+        elif pb >= 0.95:     result["bb"] = ("bear", 2, "UpperBand🔥")
+        elif pb >= 0.75:     result["bb"] = ("bear", 1, "NearUpper")
+        else:                result["bb"] = ("neutral", 0, f"MidBand({round(pb*100)}%)")
 
-    ad=adx(c)
-    if ad:
-        a,dip,dim=ad["adx"],ad["dip"],ad["dim"]
-        if a>=30 and dip>dim:   sc+=2;lbl=f"StrongUp💪"
-        elif a>=25 and dip>dim: sc+=1;lbl=f"Uptrend"
-        elif a>=30 and dim>dip: sc-=2;lbl=f"StrongDown💪"
-        elif a>=25 and dim>dip: sc-=1;lbl=f"Downtrend"
-        else:                        lbl=f"Ranging"
-        det["adx"]=lbl
+    # ATR — volatility context
+    at = calc_atr(c)
+    cl0 = cl[0] if cl else 1
+    if at:
+        atr_pct = (at/cl0)*100
+        if atr_pct < 0.003:  result["atr"] = ("neutral", -1, "TooQuiet⚠️")
+        elif atr_pct > 0.4:  result["atr"] = ("neutral", -1, "TooWild⚠️")
+        else:                result["atr"] = ("neutral", 1,  "GoodVol✅")
 
-    vd=vwap(c)
-    if vd<=-0.1:   sc+=2;lbl="BelowVWAP✅"
-    elif vd<=-0.03:sc+=1;lbl="SlightBelow"
-    elif vd>=0.1:  sc-=2;lbl="AboveVWAP✅"
-    elif vd>=0.03: sc-=1;lbl="SlightAbove"
-    else:               lbl="AtVWAP"
-    det["vwap"]=lbl
-
-    sr=snr(c)
-    if sr:
-        if sr["dts"]<0.05:   sc+=2;lbl=f"AtSupport🔥"
-        elif sr["dts"]<0.15: sc+=1;lbl=f"NearSupport"
-        elif sr["dtr"]<0.05: sc-=2;lbl=f"AtResist🔥"
-        elif sr["dtr"]<0.15: sc-=1;lbl=f"NearResist"
-        else:                     lbl=f"S:{sr['sup']}|R:{sr['res']}"
-        det["sr"]=lbl
-
-    return {"score":sc,"det":det,"error":False}
+    return result
 
 
-async def analyse(pair, duration):
-    tfl=TIMEFRAMES[duration]
-    sets=await asyncio.gather(*[fetch(pair,iv,120) for iv,_ in tfl])
-    results={}; total=0; any_data=False
-    for (iv,lbl),c in zip(tfl,sets):
-        if not c or len(c)<50: results[lbl]={"error":True,"score":0,"det":{}}; continue
-        any_data=True; r=score_tf(c); results[lbl]=r; total+=r["score"]
-    if not any_data: return {"error":True,"message":"No market data. Check API key."}
+async def run_analysis(pair, duration):
+    tfl = TIMEFRAMES[duration]
+    sets = await asyncio.gather(*[fetch(pair, iv, 150) for iv,_ in tfl])
 
-    # Count individual indicator votes
-    bull=0; bear=0; total_i=0
-    for r in results.values():
-        if r.get("error"): continue
-        for lbl in r["det"].values():
-            total_i+=1; l=lbl.lower()
-            if any(x in l for x in ["oversold","bull","belowvwap","support","goodvol","freshbullx","strongup","uptrend","lowerband","nearsupp"]):
-                bull+=1
-            elif any(x in l for x in ["overbought","bear","abovevwap","resist","freshbearx","strongdown","downtrend","upperband","nearresist"]):
-                bear+=1
+    tf_data = {}
+    for (iv,lbl), c in zip(tfl, sets):
+        if not c or len(c) < 50:
+            tf_data[lbl] = None
+            continue
+        tf_data[lbl] = analyse_tf(c)
 
-    if bull>=4 and bull>bear:    direction,emoji,sig="BUY","🟢","📈"
-    elif bear>=4 and bear>bull:  direction,emoji,sig="SELL","🔴","📉"
-    else:                        direction,emoji,sig="WAIT","🟡","⏳"
+    tfs = [lbl for _,lbl in tfl]
+    entry_lbl  = tfs[0]   # entry timeframe
+    confirm_lbl= tfs[1]   # confirmation timeframe
+    trend_lbl  = tfs[2]   # trend timeframe
 
-    pct=min(round(max(bull,bear)/max(total_i,1)*100),95)
-    tfs=[lbl for _,lbl in tfl]
-    return {"error":False,"direction":direction,"emoji":emoji,"sig":sig,
-            "pct":pct,"bull":bull,"bear":bear,"total_i":total_i,
-            "results":results,"tfs":tfs}
+    entry   = tf_data.get(entry_lbl)
+    confirm = tf_data.get(confirm_lbl)
+    trend   = tf_data.get(trend_lbl)
+
+    if not entry or not trend:
+        return {"error": True, "message": "Could not fetch market data. Try again."}
+
+    # ── GATEKEEPER 1: Trend EMA ───────────────────────────────────────────────
+    trend_ema = trend.get("ema", ("neutral", 0))
+    trend_dir = trend_ema[0]  # "bull", "bear", or "neutral"
+    if trend_dir == "neutral":
+        return _wait_result(tfs, tf_data, "Trend unclear — EMA mixed on trend TF")
+
+    # ── GATEKEEPER 2: Entry MACD must agree with trend ────────────────────────
+    entry_macd = entry.get("macd")
+    if not entry_macd or entry_macd[0] != trend_dir:
+        return _wait_result(tfs, tf_data, f"MACD disagrees with {trend_dir.upper()} trend")
+
+    # ── GATEKEEPER 3: RSI must not be extreme against direction ───────────────
+    rsi_val = entry.get("rsi_val")
+    if rsi_val is not None:
+        if trend_dir == "bull" and rsi_val > 68:
+            return _wait_result(tfs, tf_data, f"RSI({rsi_val}) overbought — avoid BUY")
+        if trend_dir == "bear" and rsi_val < 32:
+            return _wait_result(tfs, tf_data, f"RSI({rsi_val}) oversold — avoid SELL")
+
+    # ── SCORING: count confirming indicators ──────────────────────────────────
+    bull_votes = 0; bear_votes = 0; details = {}
+
+    for lbl, tfd in tf_data.items():
+        if not tfd: continue
+        for key in ["ema","macd","rsi","stoch","bb"]:
+            ind = tfd.get(key)
+            if not ind: continue
+            direction, weight = ind[0], ind[1]
+            tag = f"{lbl}_{key}"
+            label = ind[2] if len(ind)>2 else direction
+            details[tag] = (direction, label)
+            if direction == "bull":   bull_votes += weight
+            elif direction == "bear": bear_votes += weight
+
+    # ATR bonus/penalty on entry TF
+    atr_ind = entry.get("atr")
+    if atr_ind: 
+        bull_votes += atr_ind[1] if trend_dir=="bull" else 0
+        bear_votes += atr_ind[1] if trend_dir=="bear" else 0
+
+    total = bull_votes + bear_votes
+    pct = min(round((max(bull_votes,bear_votes)/max(total,1))*100), 95)
+
+    # Need 4+ weighted votes in trend direction
+    if trend_dir == "bull" and bull_votes >= 4:
+        return _signal_result("BUY","🟢","📈", bull_votes, bear_votes, pct, tfs, tf_data, details, duration)
+    elif trend_dir == "bear" and bear_votes >= 4:
+        return _signal_result("SELL","🔴","📉", bull_votes, bear_votes, pct, tfs, tf_data, details, duration)
+    else:
+        reason = f"Only {bull_votes if trend_dir=='bull' else bear_votes} votes — need 4+"
+        return _wait_result(tfs, tf_data, reason)
 
 
-# ── Format ────────────────────────────────────────────────────────────────────
+def _signal_result(direction, emoji, sig, bv, bev, pct, tfs, tf_data, details, duration):
+    return {
+        "error":False,"direction":direction,"emoji":emoji,"sig":sig,
+        "bull_votes":bv,"bear_votes":bev,"pct":pct,
+        "tfs":tfs,"tf_data":tf_data,"details":details,"duration":duration,"wait":False
+    }
 
-def icon(lbl):
-    l=lbl.lower()
-    if any(x in l for x in ["oversold","bull","belowvwap","support","goodvol","freshbullx","strongup","uptrend","lowerband","nearsupp"]): return "🟢"
-    if any(x in l for x in ["overbought","bear","abovevwap","resist","freshbearx","strongdown","downtrend","upperband","nearresist"]): return "🔴"
-    if any(x in l for x in ["squeeze","lowvol","highvol"]): return "⚠️"
+def _wait_result(tfs, tf_data, reason):
+    return {
+        "error":False,"direction":"WAIT","emoji":"🟡","sig":"⏳",
+        "tfs":tfs,"tf_data":tf_data,"reason":reason,"wait":True,
+        "bull_votes":0,"bear_votes":0,"pct":0
+    }
+
+
+# ── Formatter ─────────────────────────────────────────────────────────────────
+
+def ind_icon(direction):
+    if direction=="bull": return "🟢"
+    if direction=="bear": return "🔴"
     return "🟡"
 
-def fmt(pair, duration, a):
-    now=datetime.utcnow().strftime("%H:%M  %d %b %Y")
-    lines=["╔══════════════════════╗","║  📊 QUOTEX SIGNALS   ║","╚══════════════════════╝",
-           f"💱 *{pair}*  ⏱ *{duration}*",f"🕐 {now}","","─── TIMEFRAME BREAKDOWN ───"]
-    for tf in a["tfs"]:
-        r=a["results"].get(tf,{})
-        if r.get("error"): lines.append(f"*{tf}* ⚠️ No data"); continue
-        sc=r["score"]; bias="🟢" if sc>0 else ("🔴" if sc<0 else "🟡")
-        inds=" ".join(f"{icon(v)}{k.upper()}" for k,v in r["det"].items())
-        lines.append(f"*{tf}* {bias}`{sc:+d}`  {inds}")
-    fill=min(int(a["pct"]/10),10); bar="█"*fill+"░"*(10-fill)
-    lines+=["","──────────────────────────",""]
-    if a["direction"]=="WAIT":
-        lines+=["🟡 *WAIT ⏳*",
-                f"_🟢x{a['bull']} vs 🔴x{a['bear']} / {a['total_i']} indicators_",
-                "_Need 4+ to agree. Wait for better setup._"]
+def format_msg(pair, duration, a):
+    now = datetime.utcnow().strftime("%H:%M  %d %b %Y")
+    tfs = a["tfs"]
+    lines = [
+        "╔══════════════════════╗",
+        "║  📊 CHIMA DTRADER AI ║",
+        "╚══════════════════════╝",
+        f"💱 *{pair}*  ⏱ *{duration}*",
+        f"🕐 {now}","",
+        "─── TIMEFRAME ANALYSIS ───",
+    ]
+
+    labels = {"ema":"EMA","macd":"MACD","rsi":"RSI","stoch":"STCH","bb":"BB"}
+    for tf in tfs:
+        tfd = a["tf_data"].get(tf)
+        if not tfd:
+            lines.append(f"*{tf}* ⚠️ No data"); continue
+        ema_dir = tfd.get("ema",("neutral",0))[0]
+        bias = "🟢" if ema_dir=="bull" else ("🔴" if ema_dir=="bear" else "🟡")
+        inds = ""
+        for k,lk in labels.items():
+            ind = tfd.get(k)
+            if ind: inds += f"{ind_icon(ind[0])}{lk} "
+        lines.append(f"*{tf}* {bias}  {inds.strip()}")
+
+    lines += ["","──────────────────────────",""]
+
+    if a["wait"]:
+        lines += [
+            "🟡 *SIGNAL: WAIT ⏳*","",
+            f"_Reason: {a.get('reason','Conditions not met')}_",
+            "_Wait for a cleaner setup._"
+        ]
     else:
-        lines+=[f"{a['emoji']} *{a['direction']} {a['sig']}*",
-                f"📶 Confidence: *{a['pct']}%*  `[{bar}]`",
-                f"🗳 Votes: 🟢x{a['bull']} vs 🔴x{a['bear']} / {a['total_i']}",
-                f"⏰ *Expiry: {get_expiry_time(duration)}*",
-                "_Enter at open of next candle_"]
-    lines+=["","⚠️ _Educational only. Trade responsibly._"]
+        fill = min(int(a["pct"]/10),10)
+        bar  = "█"*fill+"░"*(10-fill)
+        lines += [
+            f"{a['emoji']} *{a['direction']} {a['sig']}*",
+            f"📶 Confidence: *{a['pct']}%*",
+            f"📊 `[{bar}]`",
+            f"🗳 Votes: 🟢{a['bull_votes']} vs 🔴{a['bear_votes']}",
+            f"⏰ *Expiry: {get_expiry(duration)}*","",
+            "_Enter at open of next candle_",
+        ]
+
+    lines += ["","⚠️ _Educational only. Trade responsibly._"]
     return "\n".join(lines)
 
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 async def start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    kb=[[InlineKeyboardButton("📊 Generate Signal",callback_data="new_signal")]]
+    kb = [[InlineKeyboardButton("📊 Generate Signal", callback_data="new_signal")]]
     await update.message.reply_text(
         "👋 Welcome to *Chima Dtrader Ai*!\n\n"
-        "🧠 *9 indicators × 3 timeframes:*\n"
-        "RSI • MACD • EMA • BB • Stoch\n"
-        "ATR • ADX • VWAP • Support/Resistance\n\n"
-        "⚡ Signal fires when 4+ indicators agree\n"
-        "⏰ Includes trade expiry time\n\n"
+        "🧠 *Intelligent signal engine:*\n"
+        "✅ Trend gatekeeper (EMA)\n"
+        "✅ MACD must confirm trend\n"
+        "✅ RSI extreme filter\n"
+        "✅ 4+ indicator votes required\n\n"
+        "⏱ *Durations:* 15s · 30s · 1m · 5m · 15m · 30m\n\n"
         "Tap below 👇",
-        reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def new_signal(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    kb=[[InlineKeyboardButton(p,callback_data=f"pair_{p}") for p in row] for row in FOREX_PAIRS]
-    await q.edit_message_text("💱 *Select a Forex pair:*",reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+    kb=[[InlineKeyboardButton(p, callback_data=f"pair_{p}") for p in row] for row in FOREX_PAIRS]
+    await q.edit_message_text("💱 *Select a Forex pair:*",
+                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     return SELECT_PAIR
 
 async def pair_selected(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     pair=q.data.replace("pair_",""); ctx.user_data["pair"]=pair
-    kb=[[InlineKeyboardButton(d,callback_data=f"dur_{d}")] for d in DURATIONS]
-    kb.append([InlineKeyboardButton("🔙 Back",callback_data="new_signal")])
+    kb=[[InlineKeyboardButton(d, callback_data=f"dur_{d}")] for d in DURATIONS]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="new_signal")])
     await q.edit_message_text(f"✅ *{pair}* selected\n\n⏱ *Select duration:*",
-                              reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     return SELECT_DURATION
 
 async def dur_selected(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
     dur=q.data.replace("dur_",""); pair=ctx.user_data.get("pair","EUR/USD")
-    await q.edit_message_text(f"📡 Fetching *{pair}* data...\n🧠 Running 9 indicators × 3 TFs ⏳",parse_mode="Markdown")
-    a=await analyse(pair,dur)
-    kb=[[InlineKeyboardButton("🔄 Refresh",callback_data=f"dur_{dur}"),
-         InlineKeyboardButton("💱 New Pair",callback_data="new_signal")]]
+    await q.edit_message_text(
+        f"📡 Fetching *{pair}* live data...\n🧠 Running analysis ⏳",
+        parse_mode="Markdown")
+    a = await run_analysis(pair, dur)
+    kb=[[InlineKeyboardButton("🔄 Refresh", callback_data=f"dur_{dur}"),
+         InlineKeyboardButton("💱 New Pair", callback_data="new_signal")]]
     if a.get("error"):
-        await q.edit_message_text(f"⚠️ *Error:* {a['message']}",parse_mode="Markdown",
-                                  reply_markup=InlineKeyboardMarkup(kb)); return SELECT_DURATION
-    await q.edit_message_text(fmt(pair,dur,a),parse_mode="Markdown",
-                              reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(f"⚠️ *Error:* {a['message']}",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+        return SELECT_DURATION
+    await q.edit_message_text(format_msg(pair, dur, a),
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     return SELECT_DURATION
 
 async def help_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Chima Dtrader Ai — How it works*\n\n"
-        "1️⃣ Select pair → 2️⃣ Select duration\n"
-        "3️⃣ Live candles fetched\n"
-        "4️⃣ 9 indicators × 3 TFs calculated\n"
-        "5️⃣ Signal fires when 4+ agree\n"
-        "6️⃣ Expiry time shown\n\n"
-        "⚠️ _Educational only._",parse_mode="Markdown")
+        "📖 *Chima Dtrader Ai*\n\n"
+        "*Signal only fires when:*\n"
+        "1️⃣ Trend TF EMA is clearly bull/bear\n"
+        "2️⃣ Entry MACD agrees with trend\n"
+        "3️⃣ RSI is not extreme against direction\n"
+        "4️⃣ 4+ weighted indicator votes confirm\n\n"
+        "*Durations:* 15s · 30s · 1m · 5m · 15m · 30m\n\n"
+        "⚠️ _Educational only._", parse_mode="Markdown")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -369,30 +423,33 @@ def main():
     print("=== CHIMA DTRADER AI STARTING ===")
     print(f"TOKEN: {'SET' if TOKEN else 'MISSING!'}")
     print(f"API KEY: {'SET' if TD_API_KEY else 'MISSING!'}")
-    if not TOKEN: print("ERROR: Set TELEGRAM_BOT_TOKEN in Render Environment"); sys.exit(1)
-
-    app=Application.builder().token(TOKEN).build()
-    conv=ConversationHandler(
-        entry_points=[CallbackQueryHandler(new_signal,pattern="^new_signal$")],
+    if not TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN missing"); sys.exit(1)
+    bot_app = Application.builder().token(TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_signal, pattern="^new_signal$")],
         states={
-            SELECT_PAIR:[CallbackQueryHandler(pair_selected,pattern="^pair_")],
-            SELECT_DURATION:[CallbackQueryHandler(dur_selected,pattern="^dur_"),
-                             CallbackQueryHandler(new_signal,pattern="^new_signal$")],
+            SELECT_PAIR:[CallbackQueryHandler(pair_selected, pattern="^pair_")],
+            SELECT_DURATION:[
+                CallbackQueryHandler(dur_selected, pattern="^dur_"),
+                CallbackQueryHandler(new_signal, pattern="^new_signal$"),
+            ],
         },
-        fallbacks=[CommandHandler("start",start)],per_message=False)
-    app.add_handler(CommandHandler("start",start))
-    app.add_handler(CommandHandler("help",help_cmd))
-    app.add_handler(conv)
+        fallbacks=[CommandHandler("start", start)], per_message=False)
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("help", help_cmd))
+    bot_app.add_handler(conv)
     print("🤖 Bot polling started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",8080))
-    flask_app=Flask(__name__)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    flask_app = Flask(__name__)
 
     @flask_app.route("/")
     def index(): return "Chima Dtrader Ai is running."
 
-    t=threading.Thread(target=lambda:flask_app.run(host="0.0.0.0",port=port,use_reloader=False),daemon=True)
-    t.start()
+    threading.Thread(
+        target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False),
+        daemon=True).start()
     main()
