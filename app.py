@@ -22,7 +22,7 @@ ASSETS = {
 }
 
 # Timeframes in seconds for IQ Option API
-TIMEFRAMES = [5, 10, 15, 30]  # seconds
+TIMEFRAMES = [5, 10, 15]  # seconds — 5s is entry trigger TF
 
 TRADE_DURATION = 60  # 1 minute in seconds
 
@@ -181,13 +181,13 @@ async def analyse_signal(api, asset_name):
         if k >= 98 or prev_k >= 98:
             overbought_count += 1
 
-    # Need at least 3 out of 4 TFs
-    if oversold_count >= 3:
+    # Need all 3 TFs or at least 2 out of 3
+    if oversold_count >= 2:
         direction = "BUY"
-    elif overbought_count >= 3:
+    elif overbought_count >= 2:
         direction = "SELL"
     else:
-        return "WAIT", f"Only {max(oversold_count, overbought_count)}/4 TFs confluent — need 3+", stoch_results
+        return "WAIT", f"Only {max(oversold_count, overbought_count)}/3 TFs confluent — need 2+", stoch_results
 
     # Step 2: Confirm with 9 MA crossover on 5s chart
     candles_5s = results[0]  # TIMEFRAMES[0] = 5s
@@ -239,7 +239,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 Welcome to *Chima Dtrader AI* 🤖\n\n"
         "🏦 Account: *DEMO*\n"
         "📈 Strategy: Stochastic Confluence + 9 EMA Cross\n"
-        "⏱ Timeframes: 5s · 10s · 15s · 30s\n"
+        "⏱ Timeframes: 5s · 10s · 15s\n"
         "⏰ Trade Duration: *1 Minute*\n\n"
         "Tap below to begin 👇",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -362,7 +362,7 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             direction, reason, stoch_data = await analyse_signal(api, asset_name)
             
             if direction == "WAIT":
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(1)  # Check every 1 second
                 continue
             
             # Get current price and balance
@@ -376,7 +376,7 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             stoch_5s  = stoch_data.get(5,  (0,0,0))
             stoch_10s = stoch_data.get(10, (0,0,0))
             stoch_15s = stoch_data.get(15, (0,0,0))
-            stoch_30s = stoch_data.get(30, (0,0,0))
+            
 
             await bot.send_message(chat_id,
                 f"🚨 *TRADE ENTRY*\n"
@@ -391,7 +391,7 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"  5s  → K: `{stoch_5s[0]}`\n"
                 f"  10s → K: `{stoch_10s[0]}`\n"
                 f"  15s → K: `{stoch_15s[0]}`\n"
-                f"  30s → K: `{stoch_30s[0]}`\n\n"
+                f"\n"
                 f"🔢 Trade: *{trades_done + 1}/{max_trades}*\n"
                 f"🏦 Balance: *${balance:.2f}*",
                 parse_mode="Markdown"
