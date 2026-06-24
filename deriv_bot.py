@@ -1,4 +1,4 @@
-import os, sys, asyncio, threading, time
+import os, sys, asyncio, json, time, threading
 from datetime import datetime
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -6,86 +6,196 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, ConversationHandler, filters
 )
-from iqoptionapi.stable_api import IQ_Option
+import websockets
 
 # ── ENV VARS ──────────────────────────────────────────────────────────────────
-TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-IQ_EMAIL   = os.environ.get("IQ_EMAIL", "")
-IQ_PASSWORD= os.environ.get("IQ_PASSWORD", "")
+TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+DERIV_APP_ID  = os.environ.get("DERIV_APP_ID", "1089")   # default public app id
+DERIV_API_URL = "wss://ws.binaryws.com/websockets/v3?app_id=" + DERIV_APP_ID
+DERIV_TOKEN   = os.environ.get("DERIV_API_TOKEN", "")    # your Deriv API token
 
-# ── ASSETS ────────────────────────────────────────────────────────────────────
+# ── ASSETS (Deriv symbol names) ───────────────────────────────────────────────
 ASSETS = {
-    "US500 OTC":  "USSC-OTC",
-    "EURUSD OTC": "EURUSD-OTC",
-    "GBPUSD OTC": "GBPUSD-OTC",
-    "Gold OTC":   "XAUUSD-OTC",
+    "Volatility 100 (1s)": "R_100",   # Volatility 100 Index (1s)
 }
 
-# Timeframes in seconds for IQ Option API
-TIMEFRAMES = [5, 10, 15]  # seconds — 5s is entry trigger TF
+# ── STRATEGY SETTINGS ─────────────────────────────────────────────────────────
+# For Volatility 100 (1s), candles move very fast — 5s/10s/15s TFs are perfect
+TIMEFRAMES      = [5, 10, 15]   # seconds
+TRADE_DURATION  = 60            # 1 minute in seconds
+CANDLES_NEEDED  = 100
 
-TRADE_DURATION = 60  # 1 minute in seconds
-
-# Stochastic settings
-STOCH_K   = 13
-STOCH_D   = 3
-STOCH_OB  = 95   # near 100 overbought
-STOCH_OS  = 5    # near 1 oversold
+STOCH_K    = 13
+STOCH_D    = 3
 EMA_PERIOD = 9
-CANDLES_NEEDED = 100
 
 # Conversation states
 SELECT_ASSET, ENTER_AMOUNT, ENTER_TRADES = range(3)
 
-# ── IQ OPTION CONNECTION ──────────────────────────────────────────────────────
 
-def connect_iq():
-    print(f"Attempting IQ Option connection with email: {IQ_EMAIL[:4]}***")
+# ── DERIV WEBSOCKET HELPERS ───────────────────────────────────────────────────
+
+async def deriv_send(ws, payload: dict) -> dict:
+    """Send a request and wait for matching response."""
+    req_id = int(time.time() * 1000) % 99999
+    payload["req_id"] = req_id
+    await ws.send(json.dumps(payload))
+    while True:
+        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+        data = json.loads(raw)
+        if data.get("req_id") == req_id or data.get("msg_type") in (
+            "authorize", "balance", "buy", "proposal_open_contract"
+        ):
+            if "error" in data:
+                raise Exception(f"Deriv API error: {data['error']['message']}")
+            return data
+
+
+async def connect_deriv():
+    """Connect and authorize with Deriv API. Returns websocket."""
     try:
-        api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-        check, reason = api.connect()
-        print(f"IQ Connect result: check={check}, reason={reason}")
-        if not check:
-            print(f"❌ IQ Option connection failed: {reason}")
-            return None
-        api.change_balance("PRACTICE")
-        balance = api.get_balance()
-        print(f"✅ Connected to IQ Option DEMO | Balance: {balance}")
-        return api
+        ws = await websockets.connect(DERIV_API_URL)
+        resp = await deriv_send(ws, {"authorize": DERIV_TOKEN})
+        account = resp.get("authorize", {})
+        balance = account.get("balance", 0)
+        currency = account.get("currency", "USD")
+        print(f"✅ Deriv connected | Balance: {balance} {currency}")
+        return ws, balance, currency
     except Exception as e:
-        print(f"❌ IQ Option exception: {type(e).__name__}: {e}")
+        print(f"❌ Deriv connection failed: {e}")
+        return None, 0, "USD"
+
+
+async def get_balance(ws) -> float:
+    """Get current demo account balance."""
+    try:
+        resp = await deriv_send(ws, {"balance": 1, "account": "current"})
+        return float(resp.get("balance", {}).get("balance", 0))
+    except:
+        return 0.0
+
+
+async def get_candles(ws, symbol: str, granularity: int, count: int = 100):
+    """
+    Fetch historical candles from Deriv.
+    granularity = seconds per candle (5, 10, 15 etc.)
+    Returns list of dicts with keys: open, high, low, close, epoch
+    sorted newest first.
+    """
+    try:
+        end_time = int(time.time())
+        start_time = end_time - (granularity * count * 2)  # extra buffer
+        resp = await deriv_send(ws, {
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": granularity,
+            "start": start_time,
+            "end": "latest",
+            "count": count,
+            "adjust_start_time": 1
+        })
+        raw_candles = resp.get("candles", [])
+        if not raw_candles:
+            return None
+        # Normalise to match IQ Option format used in indicators
+        candles = [
+            {
+                "open":  float(c["open"]),
+                "max":   float(c["high"]),
+                "min":   float(c["low"]),
+                "close": float(c["close"]),
+                "from":  c["epoch"]
+            }
+            for c in raw_candles
+        ]
+        # Sort newest first
+        return sorted(candles, key=lambda x: x["from"], reverse=True)
+    except Exception as e:
+        print(f"get_candles error ({symbol} {granularity}s): {e}")
         return None
 
-# ── INDICATORS ────────────────────────────────────────────────────────────────
+
+async def place_trade(ws, symbol: str, direction: str, amount: float) -> tuple:
+    """
+    Buy a Rise/Fall contract on Deriv demo.
+    direction: 'BUY' → CALL (Rise), 'SELL' → PUT (Fall)
+    Returns (success, contract_id)
+    """
+    try:
+        contract_type = "CALL" if direction == "BUY" else "PUT"
+
+        # Step 1: Get proposal
+        proposal_resp = await deriv_send(ws, {
+            "proposal": 1,
+            "amount": str(amount),
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": TRADE_DURATION,
+            "duration_unit": "s",
+            "symbol": symbol
+        })
+        proposal_id = proposal_resp.get("proposal", {}).get("id")
+        if not proposal_id:
+            return False, None
+
+        # Step 2: Buy
+        buy_resp = await deriv_send(ws, {
+            "buy": proposal_id,
+            "price": amount
+        })
+        contract_id = buy_resp.get("buy", {}).get("contract_id")
+        return (True, contract_id) if contract_id else (False, None)
+
+    except Exception as e:
+        print(f"place_trade error: {e}")
+        return False, None
+
+
+async def get_trade_result(ws, contract_id: int) -> float:
+    """
+    Wait for trade to expire, then return profit/loss.
+    Positive = win, Negative = loss.
+    """
+    await asyncio.sleep(TRADE_DURATION + 5)
+    try:
+        resp = await deriv_send(ws, {
+            "profit_table": 1,
+            "contract_id": contract_id,
+            "description": 1
+        })
+        contracts = resp.get("profit_table", {}).get("transactions", [])
+        if contracts:
+            return float(contracts[0].get("profit", 0))
+        # Fallback: check proposal_open_contract
+        resp2 = await deriv_send(ws, {
+            "proposal_open_contract": 1,
+            "contract_id": contract_id,
+        })
+        poc = resp2.get("proposal_open_contract", {})
+        return float(poc.get("profit", 0))
+    except Exception as e:
+        print(f"get_trade_result error: {e}")
+        return 0.0
+
+
+# ── INDICATORS (unchanged from original) ─────────────────────────────────────
 
 def calc_stochastic(candles, k_period=13, d_period=3):
-    """Calculate Stochastic Oscillator - returns (K, D, prev_K)"""
     if len(candles) < k_period + d_period + 1:
         return None
-    
     closes = [c["close"] for c in candles]
     highs  = [c["max"]   for c in candles]
     lows   = [c["min"]   for c in candles]
-    
     k_values = []
     for i in range(d_period + 1):
-        window_h = max(highs[i:i + k_period])
-        window_l = min(lows[i:i + k_period])
-        if window_h == window_l:
-            k_values.append(50.0)
-        else:
-            k = 100 * (closes[i] - window_l) / (window_h - window_l)
-            k_values.append(k)
-    
-    k_current  = k_values[0]
-    d_current  = sum(k_values[:d_period]) / d_period
-    k_previous = k_values[1]
-    
-    return round(k_current, 2), round(d_current, 2), round(k_previous, 2)
+        wh = max(highs[i:i + k_period])
+        wl = min(lows[i:i + k_period])
+        k_values.append(50.0 if wh == wl else 100 * (closes[i] - wl) / (wh - wl))
+    return round(k_values[0], 2), round(sum(k_values[:d_period]) / d_period, 2), round(k_values[1], 2)
 
 
 def calc_ema(closes, period=9):
-    """Calculate EMA"""
     if len(closes) < period:
         return None
     k = 2 / (period + 1)
@@ -96,62 +206,31 @@ def calc_ema(closes, period=9):
 
 
 def check_ema_crossover(candles, period=9):
-    """
-    Check 9 EMA crossover on latest candles.
-    Returns: 'bull' if EMA crossed up, 'bear' if crossed down, None if no cross
-    """
     closes = [c["close"] for c in candles]
     if len(closes) < period + 2:
         return None
-
-    # We need current and previous EMA vs price relationship
-    # Crossover: price crosses above/below EMA
     current_close  = closes[0]
     previous_close = closes[1]
-    
-    # Calculate EMA on slightly shifted data to get prev EMA
     ema_now  = calc_ema(closes, period)
     ema_prev = calc_ema(closes[1:], period)
-    
     if ema_now is None or ema_prev is None:
         return None
-    
-    # Bull crossover: price was below EMA, now above
     if previous_close < ema_prev and current_close > ema_now:
         return "bull"
-    # Bear crossover: price was above EMA, now below
     elif previous_close > ema_prev and current_close < ema_now:
         return "bear"
-    
     return None
 
 
 # ── SIGNAL LOGIC ─────────────────────────────────────────────────────────────
 
-async def get_candles_iq(api, asset_name, tf_seconds, count=100):
-    """Fetch candles from IQ Option"""
-    try:
-        end_time = time.time()
-        candles = api.get_candles(asset_name, tf_seconds, count, end_time)
-        if candles:
-            # Sort newest first
-            return sorted(candles, key=lambda x: x["from"], reverse=True)
-        return None
-    except Exception as e:
-        print(f"Error fetching candles {asset_name} {tf_seconds}s: {e}")
-        return None
-
-
-async def analyse_signal(api, asset_name):
+async def analyse_signal(ws, symbol: str):
     """
-    Strategy:
-    1. Stochastic (13,3,3) K line must touch level 1 or 100
-       on at least 3 out of 4 timeframes (5s, 10s, 15s, 30s)
-    2. Confirm with 9 MA crossover on 5s chart
-    Returns: 'BUY', 'SELL', or 'WAIT'
+    Same strategy as original:
+    1. Stochastic (13,3,3) K touches level 1 or 100 on 2+ of 3 timeframes
+    2. Confirm with 9 EMA crossover on 5s chart
     """
-    # Fetch candles for all 4 timeframes concurrently
-    tasks = [get_candles_iq(api, asset_name, tf, CANDLES_NEEDED) for tf in TIMEFRAMES]
+    tasks = [get_candles(ws, symbol, tf, CANDLES_NEEDED) for tf in TIMEFRAMES]
     results = await asyncio.gather(*tasks)
 
     stoch_results = {}
@@ -159,11 +238,8 @@ async def analyse_signal(api, asset_name):
         if not candles or len(candles) < STOCH_K + STOCH_D + 1:
             stoch_results[tf] = None
             continue
-        st = calc_stochastic(candles, STOCH_K, STOCH_D)
-        stoch_results[tf] = st  # (K, D, prev_K)
+        stoch_results[tf] = calc_stochastic(candles, STOCH_K, STOCH_D)
 
-    # Count TFs that touched level 1 (oversold) or 100 (overbought)
-    # Touched = current K or previous K reached the level
     oversold_count   = 0
     overbought_count = 0
 
@@ -172,16 +248,11 @@ async def analyse_signal(api, asset_name):
         if st is None:
             continue
         k, d, prev_k = st
-
-        # Touched level 1 — K at or below 2 now or on previous candle
         if k <= 2 or prev_k <= 2:
             oversold_count += 1
-
-        # Touched level 100 — K at or above 98 now or on previous candle
         if k >= 98 or prev_k >= 98:
             overbought_count += 1
 
-    # Need all 3 TFs or at least 2 out of 3
     if oversold_count >= 2:
         direction = "BUY"
     elif overbought_count >= 2:
@@ -189,42 +260,16 @@ async def analyse_signal(api, asset_name):
     else:
         return "WAIT", f"Only {max(oversold_count, overbought_count)}/3 TFs confluent — need 2+", stoch_results
 
-    # Step 2: Confirm with 9 MA crossover on 5s chart
-    candles_5s = results[0]  # TIMEFRAMES[0] = 5s
+    # EMA crossover confirmation on 5s
+    candles_5s = results[0]
     if candles_5s:
         cross = check_ema_crossover(candles_5s, EMA_PERIOD)
         if direction == "BUY" and cross != "bull":
-            return "WAIT", "Waiting for 9 MA bullish crossover on 5s", stoch_results
+            return "WAIT", "Waiting for 9 EMA bullish crossover on 5s", stoch_results
         if direction == "SELL" and cross != "bear":
-            return "WAIT", "Waiting for 9 MA bearish crossover on 5s", stoch_results
+            return "WAIT", "Waiting for 9 EMA bearish crossover on 5s", stoch_results
 
     return direction, "All conditions met ✅", stoch_results
-
-
-# ── TRADE EXECUTION ───────────────────────────────────────────────────────────
-
-async def place_trade(api, asset_name, direction, amount):
-    """Place a binary options trade on IQ Option demo"""
-    try:
-        action = "call" if direction == "BUY" else "put"
-        success, trade_id = api.buy(amount, asset_name, action, TRADE_DURATION)
-        if success:
-            return True, trade_id
-        return False, None
-    except Exception as e:
-        print(f"Trade error: {e}")
-        return False, None
-
-
-async def get_trade_result(api, trade_id):
-    """Wait for trade to close and get result"""
-    await asyncio.sleep(TRADE_DURATION + 5)  # Wait for expiry + buffer
-    try:
-        result = api.check_win_v4(trade_id)
-        return result  # Returns profit amount (positive = win, negative = loss)
-    except Exception as e:
-        print(f"Result check error: {e}")
-        return None
 
 
 # ── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
@@ -237,10 +282,12 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "👋 Welcome to *Chima Dtrader AI* 🤖\n\n"
+        "🏦 Platform: *Deriv.com*\n"
         "🏦 Account: *DEMO*\n"
         "📈 Strategy: Stochastic Confluence + 9 EMA Cross\n"
         "⏱ Timeframes: 5s · 10s · 15s\n"
-        "⏰ Trade Duration: *1 Minute*\n\n"
+        "⏰ Trade Duration: *1 Minute*\n"
+        "🎯 Asset: *Volatility 100 (1s)*\n\n"
         "Tap below to begin 👇",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
@@ -250,7 +297,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def start_trading(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    
     kb = [
         [InlineKeyboardButton("US500 OTC",  callback_data="asset_US500 OTC")],
         [InlineKeyboardButton("EURUSD OTC", callback_data="asset_EURUSD OTC")],
@@ -272,8 +318,7 @@ async def asset_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["asset"] = asset
     await q.edit_message_text(
         f"✅ Asset: *{asset}*\n\n"
-        "💵 *Enter trade amount in $:*\n"
-        "_(e.g. type 50)_",
+        "💵 *Enter trade amount in $:*\n_(e.g. type 10)_",
         parse_mode="Markdown"
     )
     return ENTER_AMOUNT
@@ -287,14 +332,12 @@ async def amount_entered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Minimum amount is $1. Enter again:")
             return ENTER_AMOUNT
     except:
-        await update.message.reply_text("⚠️ Please enter a valid number (e.g. 50):")
+        await update.message.reply_text("⚠️ Please enter a valid number (e.g. 10):")
         return ENTER_AMOUNT
-    
     ctx.user_data["amount"] = amount
     await update.message.reply_text(
         f"✅ Amount: *${amount}*\n\n"
-        "🔢 *How many trades should the bot take?*\n"
-        "_(e.g. type 5)_",
+        "🔢 *How many trades should the bot take?*\n_(e.g. type 5)_",
         parse_mode="Markdown"
     )
     return ENTER_TRADES
@@ -310,48 +353,45 @@ async def trades_entered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("⚠️ Please enter a whole number (e.g. 5):")
         return ENTER_TRADES
-    
+
     asset  = ctx.user_data.get("asset")
     amount = ctx.user_data.get("amount")
-    
-    ctx.user_data["max_trades"]    = max_trades
-    ctx.user_data["trades_done"]   = 0
-    ctx.user_data["total_profit"]  = 0.0
-    ctx.user_data["is_trading"]    = True
-    ctx.user_data["chat_id"]       = update.effective_chat.id
+    ctx.user_data["max_trades"]   = max_trades
+    ctx.user_data["is_trading"]   = True
+    ctx.user_data["chat_id"]      = update.effective_chat.id
 
     await update.message.reply_text(
         "╔══════════════════════╗\n"
         "║  📊 CHIMA DTRADER AI ║\n"
         "╚══════════════════════╝\n\n"
         f"✅ *Session Started!*\n\n"
+        f"🏦 Platform: *Deriv.com DEMO*\n"
         f"📊 Asset: *{asset}*\n"
         f"💵 Amount: *${amount}*\n"
         f"🔢 Max Trades: *{max_trades}*\n"
-        f"🏦 Account: *DEMO*\n\n"
+        f"⏰ Duration: *1 Minute*\n\n"
         "🔍 Scanning for signals...",
         parse_mode="Markdown"
     )
-    
-    # Start scanning in background
     asyncio.create_task(scan_and_trade(update, ctx))
     return ConversationHandler.END
 
 
+# ── SCAN & TRADE LOOP ─────────────────────────────────────────────────────────
+
 async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Background task: scan for signals and trade"""
     chat_id    = ctx.user_data.get("chat_id")
     asset      = ctx.user_data.get("asset")
     amount     = ctx.user_data.get("amount")
     max_trades = ctx.user_data.get("max_trades")
-    asset_name = ASSETS.get(asset)
+    symbol     = ASSETS.get(asset)
     bot        = ctx.application.bot
 
-    # Connect to IQ Option
-    api = connect_iq()
-    if not api:
+    # Connect to Deriv
+    ws, balance, currency = await connect_deriv()
+    if not ws:
         await bot.send_message(chat_id,
-            "❌ Failed to connect to IQ Option. Check credentials.")
+            "❌ Failed to connect to Deriv. Check your DERIV_API_TOKEN.")
         return
 
     trades_done  = 0
@@ -359,28 +399,27 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     while trades_done < max_trades and ctx.user_data.get("is_trading", True):
         try:
-            direction, reason, stoch_data = await analyse_signal(api, asset_name)
-            
+            direction, reason, stoch_data = await analyse_signal(ws, symbol)
+
             if direction == "WAIT":
-                await asyncio.sleep(1)  # Check every 1 second
+                await asyncio.sleep(1)
                 continue
-            
-            # Get current price and balance
-            price   = api.get_candles(asset_name, 5, 1, time.time())
-            balance = api.get_balance()
-            entry_price = price[0]["close"] if price else 0.0
+
+            # Fetch latest candle for entry price
+            latest = await get_candles(ws, symbol, 5, 1)
+            entry_price = latest[0]["close"] if latest else 0.0
+            balance     = await get_balance(ws)
             entry_time  = datetime.utcnow().strftime("%H:%M:%S")
-            
-            # ── MESSAGE 1: Entry Alert ──────────────────────────────────────
+
+            stoch_5s  = stoch_data.get(5,  (0, 0, 0)) or (0, 0, 0)
+            stoch_10s = stoch_data.get(10, (0, 0, 0)) or (0, 0, 0)
+            stoch_15s = stoch_data.get(15, (0, 0, 0)) or (0, 0, 0)
             direction_emoji = "📈" if direction == "BUY" else "📉"
-            stoch_5s  = stoch_data.get(5,  (0,0,0))
-            stoch_10s = stoch_data.get(10, (0,0,0))
-            stoch_15s = stoch_data.get(15, (0,0,0))
-            
 
             await bot.send_message(chat_id,
                 f"🚨 *TRADE ENTRY*\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
+                f"🏦 Platform: *Deriv DEMO*\n"
                 f"📊 Asset: *{asset}*\n"
                 f"🎯 Direction: *{direction}* {direction_emoji}\n"
                 f"💰 Entry Price: `{entry_price}`\n"
@@ -390,15 +429,13 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"📉 *Stochastic Readings:*\n"
                 f"  5s  → K: `{stoch_5s[0]}`\n"
                 f"  10s → K: `{stoch_10s[0]}`\n"
-                f"  15s → K: `{stoch_15s[0]}`\n"
-                f"\n"
+                f"  15s → K: `{stoch_15s[0]}`\n\n"
                 f"🔢 Trade: *{trades_done + 1}/{max_trades}*\n"
                 f"🏦 Balance: *${balance:.2f}*",
                 parse_mode="Markdown"
             )
 
-            # Place the trade
-            success, trade_id = await place_trade(api, asset_name, direction, amount)
+            success, contract_id = await place_trade(ws, symbol, direction, amount)
 
             if not success:
                 await bot.send_message(chat_id,
@@ -407,28 +444,22 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 continue
 
             trades_done += 1
-
-            # ── Wait and get result ─────────────────────────────────────────
             await bot.send_message(chat_id,
-                f"⏳ Trade placed! Waiting 1 minute for result...")
+                "⏳ *Trade placed on Deriv!* Waiting 1 minute for result...",
+                parse_mode="Markdown"
+            )
 
-            profit = await get_trade_result(api, trade_id)
-            new_balance = api.get_balance()
-
-            if profit is None:
-                await bot.send_message(chat_id, "⚠️ Could not retrieve trade result.")
-                continue
+            profit = await get_trade_result(ws, contract_id)
+            new_balance = await get_balance(ws)
 
             total_profit += profit
-            win  = profit > 0
+            win = profit > 0
             outcome_emoji = "🟢 WIN" if win else "🔴 LOSS"
             profit_str    = f"+${profit:.2f}" if win else f"-${abs(profit):.2f}"
 
-            # Get close price
-            close_candle = api.get_candles(asset_name, 5, 1, time.time())
-            close_price  = close_candle[0]["close"] if close_candle else 0.0
+            latest2 = await get_candles(ws, symbol, 5, 1)
+            close_price = latest2[0]["close"] if latest2 else 0.0
 
-            # ── MESSAGE 2: Result ───────────────────────────────────────────
             await bot.send_message(chat_id,
                 f"{'✅' if win else '❌'} *TRADE RESULT*\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
@@ -441,11 +472,10 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"💸 Profit: *{profit_str}*\n"
                 f"🏦 Balance: *${new_balance:.2f}*\n\n"
                 f"🔢 Trades: *{trades_done}/{max_trades}*\n"
-                f"📈 Session P&L: *{'+' if total_profit>=0 else ''}{total_profit:.2f}*",
+                f"📈 Session P&L: *{'+' if total_profit >= 0 else ''}{total_profit:.2f}*",
                 parse_mode="Markdown"
             )
 
-            # Small pause between trades
             if trades_done < max_trades:
                 await asyncio.sleep(10)
 
@@ -453,39 +483,46 @@ async def scan_and_trade(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             print(f"Scan/trade error: {e}")
             await asyncio.sleep(10)
 
-    # ── SESSION COMPLETE ────────────────────────────────────────────────────
+    # ── SESSION COMPLETE ──────────────────────────────────────────────────────
     ctx.user_data["is_trading"] = False
-    final_balance = api.get_balance()
-    pnl_emoji = "📈" if total_profit >= 0 else "📉"
+    try:
+        final_balance = await get_balance(ws)
+        await ws.close()
+    except:
+        final_balance = 0.0
 
+    pnl_emoji = "📈" if total_profit >= 0 else "📉"
     await bot.send_message(chat_id,
         f"🛑 *TRADING SESSION COMPLETE*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🏦 Platform: *Deriv DEMO*\n"
         f"📊 Asset: *{asset}*\n"
         f"🔢 Trades Taken: *{trades_done}/{max_trades}*\n"
-        f"💸 Total P&L: *{'+' if total_profit>=0 else ''}{total_profit:.2f}* {pnl_emoji}\n"
+        f"💸 Total P&L: *{'+' if total_profit >= 0 else ''}{total_profit:.2f}* {pnl_emoji}\n"
         f"🏦 Final Balance: *${final_balance:.2f}*\n\n"
         "Tap /start to begin a new session.",
         parse_mode="Markdown"
     )
 
 
+# ── BALANCE & STOP ────────────────────────────────────────────────────────────
+
 async def check_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text("⏳ Checking balance...")
+    await q.edit_message_text("⏳ Checking Deriv balance...")
     try:
-        api = connect_iq()
-        if api:
-            balance = api.get_balance()
+        ws, balance, currency = await connect_deriv()
+        if ws:
+            await ws.close()
             await q.edit_message_text(
-                f"🏦 *Demo Account Balance*\n\n"
-                f"💵 Balance: *${balance:.2f}*\n\n"
+                f"🏦 *Deriv Demo Account Balance*\n\n"
+                f"💵 Balance: *${balance:.2f} {currency}*\n\n"
                 "Tap /start to go back.",
                 parse_mode="Markdown"
             )
         else:
-            await q.edit_message_text("❌ Could not connect to IQ Option.")
+            await q.edit_message_text("❌ Could not connect to Deriv.")
     except Exception as e:
         await q.edit_message_text(f"❌ Error: {e}")
 
@@ -495,9 +532,7 @@ async def stop_bot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     ctx.user_data["is_trading"] = False
     await q.edit_message_text(
-        "⛔ *Bot Stopped*\n\n"
-        "All trading has been halted.\n"
-        "Tap /start to begin again.",
+        "⛔ *Bot Stopped*\n\nAll trading halted.\nTap /start to begin again.",
         parse_mode="Markdown"
     )
 
@@ -513,13 +548,16 @@ async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=== CHIMA DTRADER AI STARTING ===")
-    print(f"TOKEN:    {'SET' if TOKEN else 'MISSING!'}")
-    print(f"IQ EMAIL: {'SET' if IQ_EMAIL else 'MISSING!'}")
-    print(f"IQ PASS:  {'SET' if IQ_PASSWORD else 'MISSING!'}")
+    print("=== CHIMA DTRADER AI (DERIV) STARTING ===")
+    print(f"TELEGRAM TOKEN : {'SET' if TOKEN else 'MISSING!'}")
+    print(f"DERIV APP ID   : {DERIV_APP_ID}")
+    print(f"DERIV API TOKEN: {'SET' if DERIV_TOKEN else 'MISSING!'}")
 
     if not TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN missing")
+        sys.exit(1)
+    if not DERIV_TOKEN:
+        print("ERROR: DERIV_API_TOKEN missing")
         sys.exit(1)
 
     bot_app = Application.builder().token(TOKEN).build()
@@ -527,9 +565,8 @@ def main():
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_trading, pattern="^start_trading$")],
         states={
-            SELECT_ASSET:  [CallbackQueryHandler(asset_selected, pattern="^asset_")],
-            ENTER_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_entered)],
-            ENTER_TRADES:  [MessageHandler(filters.TEXT & ~filters.COMMAND, trades_entered)],
+            ENTER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_entered)],
+            ENTER_TRADES: [MessageHandler(filters.TEXT & ~filters.COMMAND, trades_entered)],
         },
         fallbacks=[CommandHandler("start", start)],
         per_message=False
@@ -541,7 +578,7 @@ def main():
     bot_app.add_handler(CallbackQueryHandler(stop_bot,      pattern="^stop_bot$"))
     bot_app.add_handler(conv)
 
-    print("🤖 Bot polling started!")
+    print("🤖 Deriv bot polling started!")
     bot_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
@@ -551,7 +588,7 @@ if __name__ == "__main__":
 
     @flask_app.route("/")
     def index():
-        return "Chima Dtrader AI is running."
+        return "Chima Dtrader AI (Deriv) is running."
 
     threading.Thread(
         target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False),
