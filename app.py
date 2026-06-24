@@ -145,41 +145,59 @@ async def get_candles_iq(api, asset_name, tf_seconds, count=100):
 async def analyse_signal(api, asset_name):
     """
     Strategy:
-    1. Check Stochastic (13,3,3) on all 4 TFs — must all be overbought OR all oversold
-    2. Confirm with 9 EMA crossover on 5s chart
+    1. Stochastic (13,3,3) K line must touch level 1 or 100
+       on at least 3 out of 4 timeframes (5s, 10s, 15s, 30s)
+    2. Confirm with 9 MA crossover on 5s chart
     Returns: 'BUY', 'SELL', or 'WAIT'
     """
     # Fetch candles for all 4 timeframes concurrently
     tasks = [get_candles_iq(api, asset_name, tf, CANDLES_NEEDED) for tf in TIMEFRAMES]
     results = await asyncio.gather(*tasks)
-    
+
     stoch_results = {}
     for tf, candles in zip(TIMEFRAMES, results):
         if not candles or len(candles) < STOCH_K + STOCH_D + 1:
-            return "WAIT", f"Not enough candle data on {tf}s", {}
+            stoch_results[tf] = None
+            continue
         st = calc_stochastic(candles, STOCH_K, STOCH_D)
-        if st is None:
-            return "WAIT", f"Stochastic failed on {tf}s", {}
         stoch_results[tf] = st  # (K, D, prev_K)
-    
-    # Check confluence — all 4 TFs must agree
-    all_oversold   = all(stoch_results[tf][0] <= STOCH_OS  for tf in TIMEFRAMES)
-    all_overbought = all(stoch_results[tf][0] >= STOCH_OB for tf in TIMEFRAMES)
-    
-    if not all_oversold and not all_overbought:
-        return "WAIT", "Stochastic not confluent across all timeframes", stoch_results
-    
-    direction = "BUY" if all_oversold else "SELL"
-    
-    # Step 2: Confirm with 9 EMA crossover on 5s chart
+
+    # Count TFs that touched level 1 (oversold) or 100 (overbought)
+    # Touched = current K or previous K reached the level
+    oversold_count   = 0
+    overbought_count = 0
+
+    for tf in TIMEFRAMES:
+        st = stoch_results.get(tf)
+        if st is None:
+            continue
+        k, d, prev_k = st
+
+        # Touched level 1 — K at or below 2 now or on previous candle
+        if k <= 2 or prev_k <= 2:
+            oversold_count += 1
+
+        # Touched level 100 — K at or above 98 now or on previous candle
+        if k >= 98 or prev_k >= 98:
+            overbought_count += 1
+
+    # Need at least 3 out of 4 TFs
+    if oversold_count >= 3:
+        direction = "BUY"
+    elif overbought_count >= 3:
+        direction = "SELL"
+    else:
+        return "WAIT", f"Only {max(oversold_count, overbought_count)}/4 TFs confluent — need 3+", stoch_results
+
+    # Step 2: Confirm with 9 MA crossover on 5s chart
     candles_5s = results[0]  # TIMEFRAMES[0] = 5s
-    cross = check_ema_crossover(candles_5s, EMA_PERIOD)
-    
-    if direction == "BUY" and cross != "bull":
-        return "WAIT", "Waiting for 9 EMA bullish crossover on 5s", stoch_results
-    if direction == "SELL" and cross != "bear":
-        return "WAIT", "Waiting for 9 EMA bearish crossover on 5s", stoch_results
-    
+    if candles_5s:
+        cross = check_ema_crossover(candles_5s, EMA_PERIOD)
+        if direction == "BUY" and cross != "bull":
+            return "WAIT", "Waiting for 9 MA bullish crossover on 5s", stoch_results
+        if direction == "SELL" and cross != "bear":
+            return "WAIT", "Waiting for 9 MA bearish crossover on 5s", stoch_results
+
     return direction, "All conditions met ✅", stoch_results
 
 
