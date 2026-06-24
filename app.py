@@ -40,14 +40,21 @@ SELECT_ASSET, ENTER_AMOUNT, ENTER_TRADES = range(3)
 # ── IQ OPTION CONNECTION ──────────────────────────────────────────────────────
 
 def connect_iq():
-    api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-    check, reason = api.connect()
-    if not check:
-        print(f"IQ Option connection failed: {reason}")
+    print(f"Attempting IQ Option connection with email: {IQ_EMAIL[:4]}***")
+    try:
+        api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+        check, reason = api.connect()
+        print(f"IQ Connect result: check={check}, reason={reason}")
+        if not check:
+            print(f"❌ IQ Option connection failed: {reason}")
+            return None
+        api.change_balance("PRACTICE")
+        balance = api.get_balance()
+        print(f"✅ Connected to IQ Option DEMO | Balance: {balance}")
+        return api
+    except Exception as e:
+        print(f"❌ IQ Option exception: {type(e).__name__}: {e}")
         return None
-    api.change_balance("PRACTICE")  # Demo account
-    print("✅ Connected to IQ Option DEMO")
-    return api
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
 
@@ -533,4 +540,3 @@ if __name__ == "__main__":
         daemon=True
     ).start()
     main()
-    
